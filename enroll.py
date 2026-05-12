@@ -1,3 +1,25 @@
+"""
+enroll.py  —  Guided multi-pose enrollment for maximum accuracy.
+
+Captures samples in 5 defined poses so the model has explicit coverage
+of the angle space:
+  1. Front       (look straight at camera)
+  2. Left  ~30°  (turn head left)
+  3. Right ~30°  (turn head right)
+  4. Up    ~15°  (tilt head up)
+  5. Down  ~15°  (tilt head down)
+
+60 samples per pose = 300 total per person.
+
+Usage:
+    python enroll.py
+    python enroll.py --name "Alice" --per-pose 60
+
+Controls:
+    SPACE  – start / pause capturing current pose
+    N      – skip to next pose
+    Q      – quit and save all collected data
+"""
 
 import cv2
 import mediapipe as mp
@@ -6,43 +28,35 @@ import argparse
 import os
 import csv
 
-from graph_features import build_weighted_graph, laplacian_spectrum, N_SPECTRAL
+from face_utils import extract_features, estimate_pose, build_graph, \
+                      laplacian_spectrum, N_SPECTRAL
 
 mp_face_mesh = mp.solutions.face_mesh
 DATA_FILE    = "face_data.csv"
-SPECTRAL_EVERY = 5   # recompute Laplacian every N frames during enroll
+SPECTRAL_EVERY = 5
+
+POSES = [
+    ("Front",       "Look straight at the camera",          0,   0),
+    ("Left ~30°",   "Turn your head to the LEFT",          -30,  0),
+    ("Right ~30°",  "Turn your head to the RIGHT",          30,  0),
+    ("Up ~15°",     "Tilt your head UP slightly",            0, -15),
+    ("Down ~15°",   "Tilt your head DOWN slightly",          0,  15),
+]
 
 
-def extract_features(face_landmarks, cached_spec):
-    """1434 normalised coords + 50 Laplacian eigenvalues = 1484 features."""
-    coords = []
-    for lm in face_landmarks.landmark:
-        coords.extend([lm.x, lm.y, lm.z])
-    feat = np.array(coords, dtype=np.float32).reshape(-1, 3)
-    feat -= feat.mean(axis=0)
-    s = np.linalg.norm(feat)
-    if s > 0:
-        feat /= s
-    feat = feat.flatten()
-    if cached_spec is not None:
-        feat = np.concatenate([feat, cached_spec])
-    return feat
-
-
-def draw_progress_bar(frame, collected, target, x, y, bar_w=300, bar_h=18):
-    pct = collected / target
-    cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (60, 60, 60), -1)
-    cv2.rectangle(frame, (x, y), (x + int(bar_w * pct), y + bar_h),
-                  (0, 200, 80), -1)
-    cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (120, 120, 120), 1)
-    cv2.putText(frame, f"{collected}/{target}", (x + bar_w + 8, y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+def draw_progress(frame, collected, target, x, y, w=280):
+    pct = min(collected / target, 1.0)
+    cv2.rectangle(frame, (x, y), (x+w, y+16), (50, 50, 50), -1)
+    cv2.rectangle(frame, (x, y), (x+int(w*pct), y+16), (0, 200, 80), -1)
+    cv2.rectangle(frame, (x, y), (x+w, y+16), (100, 100, 100), 1)
+    cv2.putText(frame, f"{collected}/{target}", (x+w+6, y+13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name",    required=False)
-    parser.add_argument("--samples", type=int, default=300)
+    parser.add_argument("--name",      required=False)
+    parser.add_argument("--per-pose",  type=int, default=60)
     args = parser.parse_args()
 
     if args.name:
@@ -50,17 +64,11 @@ def main():
     else:
         name = input("Enter your name: ").strip()
         while not name:
-            name = input("Name cannot be empty. Enter your name: ").strip()
+            name = input("Name cannot be empty: ").strip()
 
-    target    = args.samples
-    collected = 0
-    capturing = False
-    rows      = []
-    frame_n   = 0
-    cached_spec  = None
-    spec_frame_n = -999
-
-    cap = cv2.VideoCapture(0)
+    per_pose  = args.per_pose
+    all_rows  = []
+    cap       = cv2.VideoCapture(0)
 
     with mp_face_mesh.FaceMesh(
         max_num_faces=1,
@@ -69,77 +77,101 @@ def main():
         min_tracking_confidence=0.5,
     ) as face_mesh:
 
-        print(f"\nEnrolling: {name}  (target: {target} samples)")
-        print("Tip: slowly move your head in different directions while capturing.")
-        print("Press SPACE to start, Q to quit.\n")
+        for pose_idx, (pose_name, instruction, target_yaw, target_pitch) in enumerate(POSES):
+            collected    = 0
+            capturing    = False
+            frame_n      = 0
+            cached_spec  = None
+            spec_frame_n = -999
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+            print(f"\nPose {pose_idx+1}/{len(POSES)}: {pose_name}")
+            print(f"  → {instruction}")
+            print(f"  Press SPACE to start, N to skip, Q to quit.\n")
 
-            h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = face_mesh.process(rgb)
-            rgb.flags.writeable = True
-            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            while cap.isOpened() and collected < per_pose:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            face_found = results.multi_face_landmarks is not None
+                h, w = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb.flags.writeable = False
+                results = face_mesh.process(rgb)
+                rgb.flags.writeable = True
+                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            if face_found:
-                lms = results.multi_face_landmarks[0]
+                face_found = results.multi_face_landmarks is not None
+                yaw = pitch = roll = 0.0
 
-                # update Laplacian cache
-                if frame_n - spec_frame_n >= SPECTRAL_EVERY:
-                    G           = build_weighted_graph(lms)
-                    cached_spec = laplacian_spectrum(G, k=N_SPECTRAL)
-                    spec_frame_n = frame_n
+                if face_found:
+                    lms = results.multi_face_landmarks[0]
 
-                if capturing and collected < target:
+                    if frame_n - spec_frame_n >= SPECTRAL_EVERY:
+                        G           = build_graph(lms)
+                        cached_spec = laplacian_spectrum(G, k=N_SPECTRAL)
+                        spec_frame_n = frame_n
+
                     try:
-                        feat = extract_features(lms, cached_spec)
-                        rows.append([name] + feat.tolist())
-                        collected += 1
+                        feat, yaw, pitch, roll = extract_features(
+                            lms, cached_spec)
+                        if capturing:
+                            all_rows.append([name] + feat.tolist())
+                            collected += 1
                     except Exception:
                         pass
 
-            # ── overlay ──────────────────────────────────────────────────────
-            status = "Capturing..." if capturing else "Press SPACE to start"
-            color  = (0, 200, 0) if capturing else (0, 165, 255)
+                # ── overlay ──────────────────────────────────────────────────
+                # dark banner at top
+                cv2.rectangle(frame, (0, 0), (w, 110), (20, 20, 20), -1)
 
-            cv2.putText(frame, f"Enrolling: {name}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            cv2.putText(frame, status, (10, 62),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.putText(frame, f"Enrolling: {name}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+                cv2.putText(frame,
+                            f"Pose {pose_idx+1}/{len(POSES)}: {pose_name}",
+                            (10, 52), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, (0, 200, 255), 2)
+                cv2.putText(frame, instruction, (10, 76),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-            draw_progress_bar(frame, collected, target, 10, 85)
+                draw_progress(frame, collected, per_pose, 10, 88)
 
-            hints = [
-                "Move head slowly L/R/U/D for best accuracy",
-                "Keep face well lit",
-                "SPACE = start/pause   Q = save & quit",
-            ]
-            for i, hint in enumerate(hints):
-                cv2.putText(frame, hint, (10, h - 55 + i * 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
+                # pose indicator
+                pose_color = (0, 220, 0) if capturing else (0, 165, 255)
+                status = "Capturing..." if capturing else "SPACE=start  N=skip  Q=quit"
+                cv2.putText(frame, status, (10, h - 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, pose_color, 1)
 
-            if not face_found:
-                cv2.putText(frame, "No face detected", (10, 115),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                # live pose angles
+                cv2.putText(frame,
+                            f"Yaw:{yaw:+.0f}°  Pitch:{pitch:+.0f}°  Roll:{roll:+.0f}°",
+                            (10, h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
 
-            cv2.imshow("Enroll", frame)
-            frame_n += 1
+                if not face_found:
+                    cv2.putText(frame, "No face detected", (10, 130),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord(" "):
-                capturing = not capturing
-            elif key == ord("q") or collected >= target:
-                break
+                cv2.imshow("Enroll", frame)
+                frame_n += 1
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord(" "):
+                    capturing = not capturing
+                elif key == ord("n"):
+                    print(f"  Skipped (collected {collected})")
+                    break
+                elif key == ord("q"):
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    _save(all_rows, name)
+                    return
 
     cap.release()
     cv2.destroyAllWindows()
+    _save(all_rows, name)
 
+
+def _save(rows, name):
     if not rows:
         print("No data collected.")
         return
