@@ -6,6 +6,8 @@ The neural network IS a directed weighted graph:
   Edges  = weighted connections between neurons (the learned weights)
   Direction = input → hidden layers → output
 
+Works for both one_person (centroid) and multi_person (MLP + LDA) models.
+
 Usage:
     python visualize.py
 
@@ -22,21 +24,31 @@ import joblib
 import os
 import networkx as nx
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 
 MODEL_FILE = "face_model.pkl"
 
 
-def load_model():
+def load_bundle():
     if not os.path.isfile(MODEL_FILE):
         print(f"ERROR: {MODEL_FILE} not found. Run train.py first.")
         exit(1)
-    bundle = joblib.load(MODEL_FILE)
-    return bundle["model"], bundle["scaler"], bundle["encoder"]
+    return joblib.load(MODEL_FILE)
 
 
-# ── 0. Neural network as a directed weighted graph (graph theory view) ───────
+def check_multi_person(bundle):
+    """Return True if the bundle contains a trained MLP, False otherwise."""
+    if bundle.get("mode") != "multi_person":
+        print(
+            f"Model is in '{bundle.get('mode')}' mode (only one person enrolled).\n"
+            "Skipping MLP-specific plots (loss curve, weight heatmaps, activations).\n"
+            "Enroll at least two people and retrain to see the full visualisation."
+        )
+        return False
+    return True
+
+
+# ── 0. Neural network as a directed weighted graph ───────────────────────────
 def plot_nn_as_graph(ax, model, encoder):
     """
     Build a NetworkX DiGraph where:
@@ -44,35 +56,32 @@ def plot_nn_as_graph(ax, model, encoder):
       - Each weight is a directed edge with the weight value
     Only a sample of neurons/edges is drawn to keep it readable.
     """
-    n_inputs  = model.coefs_[0].shape[0]
-    hidden    = list(model.hidden_layer_sizes)
-    n_outputs = model.coefs_[-1].shape[1]
+    n_inputs    = model.coefs_[0].shape[0]
+    hidden      = list(model.hidden_layer_sizes)
+    n_outputs   = model.coefs_[-1].shape[1]
     layer_sizes = [n_inputs] + hidden + [n_outputs]
 
-    MAX_PER_LAYER = 8   # show at most this many neurons per layer
+    MAX_PER_LAYER = 8
 
     DG = nx.DiGraph()
 
-    # sample indices per layer
     sampled = []
     for size in layer_sizes:
         idx = np.linspace(0, size - 1, min(size, MAX_PER_LAYER), dtype=int)
         sampled.append(idx)
 
-    # add nodes with positions
     n_layers = len(layer_sizes)
     for li, indices in enumerate(sampled):
-        x = li / (n_layers - 1)
+        x  = li / (n_layers - 1)
         ys = np.linspace(0.1, 0.9, len(indices))
-        for ni, (orig_idx, y) in enumerate(zip(indices, ys)):
+        for orig_idx, y in zip(indices, ys):
             node_id = f"L{li}_N{orig_idx}"
             DG.add_node(node_id, pos=(x, y), layer=li)
 
-    # add edges with weights sampled from weight matrix
     for li in range(len(layer_sizes) - 1):
         coef = model.coefs_[li]
-        for src_ni, src_orig in enumerate(sampled[li]):
-            for dst_ni, dst_orig in enumerate(sampled[li + 1]):
+        for src_orig in sampled[li]:
+            for dst_orig in sampled[li + 1]:
                 w = coef[src_orig, dst_orig]
                 DG.add_edge(f"L{li}_N{src_orig}",
                             f"L{li+1}_N{dst_orig}",
@@ -81,13 +90,11 @@ def plot_nn_as_graph(ax, model, encoder):
     pos    = nx.get_node_attributes(DG, "pos")
     layers = nx.get_node_attributes(DG, "layer")
 
-    # color nodes by layer
     layer_colors = plt.cm.plasma(np.linspace(0.1, 0.9, n_layers))
     node_colors  = [layer_colors[layers[n]] for n in DG.nodes()]
 
-    # color edges by weight (red=positive, blue=negative)
-    weights  = [DG[u][v]["weight"] for u, v in DG.edges()]
-    wmax     = max(abs(w) for w in weights) if weights else 1
+    weights     = [DG[u][v]["weight"] for u, v in DG.edges()]
+    wmax        = max(abs(w) for w in weights) if weights else 1
     edge_colors = [plt.cm.RdBu_r((w / wmax + 1) / 2) for w in weights]
     edge_widths = [0.5 + 1.5 * abs(w) / wmax for w in weights]
 
@@ -98,7 +105,6 @@ def plot_nn_as_graph(ax, model, encoder):
                            arrows=True, arrowsize=8,
                            connectionstyle="arc3,rad=0.05")
 
-    # layer labels
     layer_names = (["Input"] +
                    [f"H{i+1}" for i in range(len(hidden))] +
                    ["Output"])
@@ -108,7 +114,6 @@ def plot_nn_as_graph(ax, model, encoder):
                 color="white", fontsize=8,
                 bbox=dict(boxstyle="round,pad=0.2", fc="#333", ec="none"))
 
-    # graph theory stats
     n_nodes = DG.number_of_nodes()
     n_edges = DG.number_of_edges()
     density = nx.density(DG)
@@ -122,12 +127,11 @@ def plot_nn_as_graph(ax, model, encoder):
     ax.axis("off")
 
 
-
 def plot_architecture(ax, model, encoder):
     """Draw circles for neurons in each layer, connected by lines."""
-    n_inputs   = model.coefs_[0].shape[0]
-    hidden     = list(model.hidden_layer_sizes)
-    n_outputs  = model.coefs_[-1].shape[1]
+    n_inputs    = model.coefs_[0].shape[0]
+    hidden      = list(model.hidden_layer_sizes)
+    n_outputs   = model.coefs_[-1].shape[1]
     layer_sizes = [n_inputs] + hidden + [n_outputs]
     layer_names = (
         [f"Input\n({n_inputs})"]
@@ -135,36 +139,32 @@ def plot_architecture(ax, model, encoder):
         + [f"Output\n({n_outputs})"]
     )
 
-    max_display = 12          # max neurons to draw per layer (rest are "...")
+    max_display = 12
     n_layers    = len(layer_sizes)
     x_positions = np.linspace(0.05, 0.95, n_layers)
 
-    neuron_positions = []     # list of (x, [y...]) per layer
+    neuron_positions = []
 
     for li, (x, size) in enumerate(zip(x_positions, layer_sizes)):
         display = min(size, max_display)
         ys = np.linspace(0.1, 0.9, display)
         neuron_positions.append((x, ys))
 
-        # draw connections to previous layer
         if li > 0:
             px, pys = neuron_positions[li - 1]
             for py in pys:
                 for y in ys:
                     ax.plot([px, x], [py, y], color="#cccccc", lw=0.4, zorder=1)
 
-        # draw neurons
         for y in ys:
             circle = plt.Circle((x, y), 0.025, color="#4C9BE8",
                                  ec="white", lw=1.2, zorder=3)
             ax.add_patch(circle)
 
-        # ellipsis if truncated
         if size > max_display:
             ax.text(x, 0.04, "...", ha="center", va="center",
                     fontsize=11, color="#888888")
 
-        # layer label
         ax.text(x, 0.97, layer_names[li], ha="center", va="top",
                 fontsize=8, color="white",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#333333", ec="none"))
@@ -176,7 +176,7 @@ def plot_architecture(ax, model, encoder):
     ax.set_title("Network Architecture", color="white", fontsize=13, pad=10)
 
 
-# ── 2. Training loss curve ───────────────────────────────────────────────────
+# ── 2. Training loss curve ────────────────────────────────────────────────────
 def plot_loss(ax, model):
     if not hasattr(model, "loss_curve_"):
         ax.text(0.5, 0.5, "No loss curve available", ha="center",
@@ -199,17 +199,16 @@ def plot_loss(ax, model):
         spine.set_edgecolor("#555555")
 
 
-# ── 3. Weight heatmaps ───────────────────────────────────────────────────────
+# ── 3. Weight heatmaps ────────────────────────────────────────────────────────
 def plot_weights(axes, model):
     """One heatmap per layer showing the weight matrix (sampled if large)."""
     for i, (coef, ax) in enumerate(zip(model.coefs_, axes)):
-        # sample rows/cols so the heatmap stays readable
         max_show = 60
-        rows = coef.shape[0]
-        cols = coef.shape[1]
-        row_idx = np.linspace(0, rows - 1, min(rows, max_show), dtype=int)
-        col_idx = np.linspace(0, cols - 1, min(cols, max_show), dtype=int)
-        sample  = coef[np.ix_(row_idx, col_idx)]
+        rows     = coef.shape[0]
+        cols     = coef.shape[1]
+        row_idx  = np.linspace(0, rows - 1, min(rows, max_show), dtype=int)
+        col_idx  = np.linspace(0, cols - 1, min(cols, max_show), dtype=int)
+        sample   = coef[np.ix_(row_idx, col_idx)]
 
         vmax = np.abs(sample).max()
         im   = ax.imshow(sample, aspect="auto", cmap="RdBu_r",
@@ -229,18 +228,18 @@ def plot_weights(axes, model):
             spine.set_edgecolor("#555555")
 
 
-# ── 4. Per-class activation bars ─────────────────────────────────────────────
+# ── 4. Per-class activation bars ──────────────────────────────────────────────
 def plot_activations(ax, model, encoder, scaler):
     """
     Feed a zero vector through the network and show the output probabilities.
-    This is just a baseline — replace with a real sample for meaningful output.
+    This is a baseline — replace with a real sample for meaningful output.
     """
     zero_input = np.zeros((1, model.coefs_[0].shape[0]))
-    proba = model.predict_proba(zero_input)[0]
-    classes = encoder.classes_
+    proba      = model.predict_proba(zero_input)[0]
+    classes    = encoder.classes_
 
     colors = ["#4C9BE8" if p < 0.5 else "#E84C4C" for p in proba]
-    bars = ax.barh(classes, proba, color=colors, edgecolor="#555555")
+    bars   = ax.barh(classes, proba, color=colors, edgecolor="#555555")
     ax.set_xlim(0, 1)
     ax.set_xlabel("Probability", color="white")
     ax.set_title("Output Layer Activations\n(zero input baseline)",
@@ -255,23 +254,63 @@ def plot_activations(ax, model, encoder, scaler):
                 f"{p*100:.1f}%", va="center", color="white", fontsize=9)
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── one-person centroid visualisation ─────────────────────────────────────────
+def plot_centroid_info(fig, bundle):
+    """Simple summary plot for single-person centroid models."""
+    ax = fig.add_subplot(111)
+    ax.set_facecolor("#1e1e1e")
+    ax.axis("off")
+
+    centroid  = bundle["centroid"]
+    threshold = bundle["threshold"]
+    name      = bundle["name"]
+
+    info = (
+        f"Mode: Single-person centroid\n\n"
+        f"Enrolled person: {name}\n"
+        f"Centroid dimensions: {centroid.shape[0]}\n"
+        f"Recognition threshold: {threshold:.4f}\n\n"
+        f"Enroll at least two people and retrain\n"
+        f"to see the full MLP + LDA visualisation."
+    )
+    ax.text(0.5, 0.5, info, ha="center", va="center",
+            color="white", fontsize=14, transform=ax.transAxes,
+            bbox=dict(boxstyle="round,pad=0.6", fc="#2a2a2a", ec="#555"))
+    ax.set_title("Face Recognition Model — Single Person",
+                 color="white", fontsize=14)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 def main():
-    model, scaler, encoder = load_model()
+    bundle = load_bundle()
+
+    plt.style.use("dark_background")
+
+    if not check_multi_person(bundle):
+        # one-person mode: show a simple summary
+        fig = plt.figure(figsize=(10, 6), facecolor="#121212")
+        fig.suptitle("Neural Network Visualizer — Face Recognition",
+                     color="white", fontsize=14, y=0.99)
+        plot_centroid_info(fig, bundle)
+        plt.tight_layout()
+        plt.savefig("nn_visualization.png", dpi=150, bbox_inches="tight",
+                    facecolor="#121212")
+        print("Saved → nn_visualization.png")
+        plt.show()
+        return
+
+    model   = bundle["model"]
+    scaler  = bundle["scaler"]
+    encoder = bundle["encoder"]
 
     n_weight_plots = len(model.coefs_)
 
-    plt.style.use("dark_background")
     fig = plt.figure(figsize=(20, 12), facecolor="#121212")
     fig.suptitle(
-        "Neural Network Visualizer — Face Recognition  |  Graph Theory View",
+        "Neural Network Visualizer — Face Recognition  |  PCA + LDA + MLP",
         color="white", fontsize=14, y=0.99
     )
 
-    # 3 rows:
-    #   row 0: NN as graph (full width)
-    #   row 1: architecture + loss curve
-    #   row 2: weight heatmaps + activations
     gs0 = gridspec.GridSpec(1, 1, figure=fig,
                             left=0.04, right=0.96,
                             top=0.93, bottom=0.67, wspace=0.3)
