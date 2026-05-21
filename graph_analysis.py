@@ -29,6 +29,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import networkx as nx
+import logging
 import matplotlib
 matplotlib.use("Agg")          # render to image buffer, not a GUI window
 import matplotlib.pyplot as plt
@@ -37,9 +38,12 @@ import io
 
 from face_utils import build_graph, laplacian_spectrum, N_SPECTRAL
 
-mp_face_mesh      = mp.solutions.face_mesh
-mp_drawing        = mp.solutions.drawing_utils
-mp_draw_styles    = mp.solutions.drawing_styles
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+
+mp_face_mesh   = mp.solutions.face_mesh
+mp_drawing     = mp.solutions.drawing_utils
+mp_draw_styles = mp.solutions.drawing_styles
 
 PLOT_W, PLOT_H = 640, 480    # size of the matplotlib panel in pixels
 
@@ -105,7 +109,7 @@ def render_spectrum_plot(eigenvalues, graph_stats):
     row_h      = 0.115
     for ri, row in enumerate(rows):
         y = 1.0 - ri * row_h
-        for ci, (cell, cw) in enumerate(zip(row, col_widths)):
+        for ci, (cell, _cw) in enumerate(zip(row, col_widths)):
             style = dict(color="white", fontsize=7.5, va="top")
             if ri == 0:
                 style["fontweight"] = "bold"
@@ -152,8 +156,12 @@ def main():
     frame_count     = 0
     save_next       = False
 
-    print("Laplacian Spectrum Analyser")
-    print("  S = save snapshot  |  Q = quit\n")
+    # initialise stats and eigenvalues so they're always defined
+    stats       = None
+    eigenvalues = None
+
+    log.info("Laplacian Spectrum Analyser")
+    log.info("  S = save snapshot  |  Q = quit\n")
 
     with mp_face_mesh.FaceMesh(
         max_num_faces=1,
@@ -168,7 +176,7 @@ def main():
                 break
 
             h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb.flags.writeable = False
             results = face_mesh.process(rgb)
             rgb.flags.writeable = True
@@ -197,21 +205,24 @@ def main():
 
                 # recompute spectrum periodically
                 if frame_count % RECOMPUTE_EVERY == 0:
-                    G           = build_graph(lms)
-                    eigenvalues = laplacian_spectrum(G, k=N_SPECTRAL)
-                    stats       = compute_graph_stats(G, eigenvalues)
-                    plot_img    = render_spectrum_plot(eigenvalues, stats)
+                    try:
+                        G           = build_graph(lms)
+                        eigenvalues = laplacian_spectrum(G, k=N_SPECTRAL)
+                        stats       = compute_graph_stats(G, eigenvalues)
+                        plot_img    = render_spectrum_plot(eigenvalues, stats)
 
-                    if save_next:
-                        cv2.imwrite("spectrum_snapshot.png", plot_img)
-                        print("Saved → spectrum_snapshot.png")
-                        save_next = False
+                        if save_next:
+                            cv2.imwrite("spectrum_snapshot.png", plot_img)
+                            log.info("Saved → spectrum_snapshot.png")
+                            save_next = False
+                    except Exception as exc:
+                        log.warning("Spectrum computation error: %s", exc)
 
-                # overlay λ₁ on webcam frame
-                lam1_str = f"Spectral gap λ₁ = {stats['lambda1']:.4f}" \
-                           if 'stats' in dir() else ""
-                cv2.putText(frame, lam1_str, (10, h - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 230, 150), 1)
+                # overlay λ₁ on webcam frame — only if stats have been computed
+                if stats is not None:
+                    lam1_str = f"Spectral gap λ₁ = {stats['lambda1']:.4f}"
+                    cv2.putText(frame, lam1_str, (10, h - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 230, 150), 1)
 
             # resize webcam frame to match plot height
             cam_resized = cv2.resize(frame, (PLOT_W, PLOT_H))

@@ -1,57 +1,54 @@
 """
 face_utils.py  —  Shared feature extraction with pose normalization.
 
-Implements all four accuracy improvements:
+Feature vector layout (1534 values total):
+  1434  pose-normalised landmark coordinates  (478 landmarks × 3)
+    50  distance ratio features               (scale/rotation invariant)
+    50  Laplacian eigenvalues                 (graph-theoretic topology)
 
-1. POSE NORMALIZATION
-   Rotate all 478 landmarks so the face always points forward before
-   extracting features. Uses the nose tip, left/right eye corners and
-   chin to compute yaw, pitch, roll and applies the inverse rotation.
-
-2. DISTANCE RATIO FEATURES
-   Compute 50 carefully chosen inter-landmark distances (eye width,
-   nose length, jaw width, mouth width, etc.) and express them as
-   ratios relative to the inter-ocular distance.  Ratios are invariant
-   to head scale and more robust to rotation than raw coordinates.
-
-3. LAPLACIAN SPECTRUM  (graph-theoretic)
-   First 50 eigenvalues of the normalised Laplacian of the face mesh
-   graph.  Captures the weighted topology of the face.
-
-4. POSE ESTIMATION
-   Returns yaw / pitch / roll so the caller can gate confidence on
-   extreme angles.
-
-Final feature vector (1484 values):
-  1434  normalised + pose-corrected landmark coordinates
-    50  Laplacian eigenvalues
+Constants exported so every module stays in sync:
+  N_SPECTRAL   = 50   (Laplacian eigenvalues)
+  N_RATIOS     = 50   (distance ratio features)
+  N_COORDS     = 1434 (landmark coordinates)
+  FEAT_DIM     = 1534 (total feature vector length)
+  SCHEMA_VER   = 2    (bump whenever feature layout changes)
 """
 
+import logging
 import numpy as np
 import networkx as nx
 import mediapipe as mp
 
+logger = mp.solutions.face_mesh  # silence mediapipe; use our own logger
+log    = logging.getLogger(__name__)
+
 mp_face_mesh     = mp.solutions.face_mesh
 TESS_CONNECTIONS = frozenset(mp_face_mesh.FACEMESH_TESSELATION)
-N_SPECTRAL       = 50
+
+# ── feature dimension constants (single source of truth) ─────────────────────
+N_SPECTRAL = 50    # Laplacian eigenvalues
+N_RATIOS   = 50    # distance ratio features
+N_COORDS   = 1434  # 478 landmarks × 3
+FEAT_DIM   = N_COORDS + N_RATIOS + N_SPECTRAL   # 1534
+SCHEMA_VER = 2     # increment when feature layout changes
 
 # ── key landmark indices ──────────────────────────────────────────────────────
-NOSE_TIP         = 4
-CHIN             = 152
-LEFT_EYE_OUTER   = 33
-RIGHT_EYE_OUTER  = 263
-LEFT_EYE_INNER   = 133
-RIGHT_EYE_INNER  = 362
-LEFT_MOUTH       = 61
-RIGHT_MOUTH      = 291
-LEFT_EYEBROW     = 70
-RIGHT_EYEBROW    = 300
-FOREHEAD         = 10
-LEFT_CHEEK       = 234
-RIGHT_CHEEK      = 454
-NOSE_BASE        = 2
-UPPER_LIP        = 13
-LOWER_LIP        = 14
+NOSE_TIP        = 4
+CHIN            = 152
+LEFT_EYE_OUTER  = 33
+RIGHT_EYE_OUTER = 263
+LEFT_EYE_INNER  = 133
+RIGHT_EYE_INNER = 362
+LEFT_MOUTH      = 61
+RIGHT_MOUTH     = 291
+LEFT_EYEBROW    = 70
+RIGHT_EYEBROW   = 300
+FOREHEAD        = 10
+LEFT_CHEEK      = 234
+RIGHT_CHEEK     = 454
+NOSE_BASE       = 2
+UPPER_LIP       = 13
+LOWER_LIP       = 14
 
 # 50 distance pairs — chosen to capture face geometry robustly
 DISTANCE_PAIRS = [
@@ -114,6 +111,9 @@ DISTANCE_PAIRS = [
     (FOREHEAD,        RIGHT_MOUTH),
 ]
 
+assert len(DISTANCE_PAIRS) == N_RATIOS, \
+    f"DISTANCE_PAIRS has {len(DISTANCE_PAIRS)} entries but N_RATIOS={N_RATIOS}"
+
 
 # ── pose estimation ───────────────────────────────────────────────────────────
 def estimate_pose(lms):
@@ -129,16 +129,11 @@ def estimate_pose(lms):
     l_eye = np.array([lms[LEFT_EYE_OUTER].x,  lms[LEFT_EYE_OUTER].y,  lms[LEFT_EYE_OUTER].z])
     r_eye = np.array([lms[RIGHT_EYE_OUTER].x, lms[RIGHT_EYE_OUTER].y, lms[RIGHT_EYE_OUTER].z])
 
-    # face vertical axis
     vert  = chin - nose
-    # face horizontal axis
     horiz = r_eye - l_eye
 
-    # yaw: how much the face is turned left/right
     yaw   = float(np.degrees(np.arctan2(horiz[2], horiz[0])))
-    # pitch: how much the face is tilted up/down
     pitch = float(np.degrees(np.arctan2(-vert[2], vert[1])))
-    # roll: in-plane rotation
     roll  = float(np.degrees(np.arctan2(horiz[1], horiz[0])))
 
     return yaw, pitch, roll
@@ -159,7 +154,7 @@ def normalize_pose(coords_3d):
       1. Translate centroid to origin
       2. Align the inter-ocular axis to the X axis (remove roll)
       3. Align the nose-chin axis to the Y axis (remove pitch)
-      4. Scale to unit size
+      4. Scale to unit inter-ocular distance
     Returns normalised (478, 3) array.
     """
     pts = coords_3d.copy()
@@ -168,8 +163,8 @@ def normalize_pose(coords_3d):
     pts -= pts.mean(axis=0)
 
     # 2. remove roll — rotate so eye line is horizontal
-    l_eye = pts[LEFT_EYE_OUTER]
-    r_eye = pts[RIGHT_EYE_OUTER]
+    l_eye   = pts[LEFT_EYE_OUTER]
+    r_eye   = pts[RIGHT_EYE_OUTER]
     eye_vec = r_eye - l_eye
     roll_angle = np.arctan2(eye_vec[1], eye_vec[0])
     cos_r, sin_r = np.cos(-roll_angle), np.sin(-roll_angle)
@@ -179,9 +174,9 @@ def normalize_pose(coords_3d):
     pts = pts @ Rz.T
 
     # 3. remove pitch — rotate so nose-chin axis is vertical
-    nose = pts[NOSE_TIP]
-    chin = pts[CHIN]
-    vert_vec = chin - nose
+    nose      = pts[NOSE_TIP]
+    chin      = pts[CHIN]
+    vert_vec  = chin - nose
     pitch_angle = np.arctan2(vert_vec[2], vert_vec[1])
     cos_p, sin_p = np.cos(-pitch_angle), np.sin(-pitch_angle)
     Rx = np.array([[1, 0,      0     ],
@@ -200,8 +195,10 @@ def normalize_pose(coords_3d):
 # ── distance ratio features ───────────────────────────────────────────────────
 def distance_ratios(pts):
     """
-    Compute 50 inter-landmark distances, normalised by inter-ocular distance.
-    Returns a vector of length 50.
+    Compute N_RATIOS inter-landmark distances normalised by inter-ocular
+    distance.  Ratios are invariant to head scale and more robust to
+    rotation than raw coordinates.
+    Returns a float32 vector of length N_RATIOS (50).
     """
     iod = np.linalg.norm(pts[RIGHT_EYE_OUTER] - pts[LEFT_EYE_OUTER])
     if iod < 1e-6:
@@ -217,20 +214,27 @@ def distance_ratios(pts):
 
 # ── Laplacian spectrum ────────────────────────────────────────────────────────
 def build_graph(face_landmarks):
-    G = nx.Graph()
+    """Build a weighted NetworkX graph from MediaPipe face mesh landmarks."""
+    G   = nx.Graph()
     lms = face_landmarks.landmark
     for idx, lm in enumerate(lms):
         G.add_node(idx, x=lm.x, y=lm.y, z=lm.z)
     for i, j in TESS_CONNECTIONS:
         li, lj = lms[i], lms[j]
-        dist = np.sqrt((li.x-lj.x)**2 + (li.y-lj.y)**2 + (li.z-lj.z)**2)
+        dist = np.sqrt((li.x - lj.x) ** 2 +
+                       (li.y - lj.y) ** 2 +
+                       (li.z - lj.z) ** 2)
         G.add_edge(i, j, weight=dist)
     return G
 
 
 def laplacian_spectrum(G, k=N_SPECTRAL):
+    """
+    Return the first k eigenvalues of the normalised Laplacian.
+    Runs in O(n³) — cache the result and recompute only every N frames.
+    """
     nodelist = sorted(G.nodes())
-    L = nx.normalized_laplacian_matrix(G, nodelist=nodelist).toarray()
+    L    = nx.normalized_laplacian_matrix(G, nodelist=nodelist).toarray()
     eigs = np.linalg.eigvalsh(L)[:k]
     if len(eigs) < k:
         eigs = np.pad(eigs, (0, k - len(eigs)))
@@ -240,30 +244,41 @@ def laplacian_spectrum(G, k=N_SPECTRAL):
 # ── full feature extraction ───────────────────────────────────────────────────
 def extract_features(face_landmarks, cached_spec=None):
     """
-    Returns (feature_vector, yaw, pitch, roll).
+    Extract the full 1534-D feature vector from a MediaPipe face landmark set.
 
-    Feature vector (1484 values):
-      1434  pose-normalised landmark coordinates (478 × 3)
-        50  Laplacian eigenvalues
+    Returns
+    -------
+    feat : np.ndarray, shape (FEAT_DIM,), dtype float32
+        Layout:
+          [0        : N_COORDS]              pose-normalised landmark coords
+          [N_COORDS : N_COORDS + N_RATIOS]   distance ratio features
+          [N_COORDS + N_RATIOS : FEAT_DIM]   Laplacian eigenvalues
+    yaw, pitch, roll : float
+        Head pose angles in degrees (estimated before normalisation).
     """
     lms = face_landmarks.landmark
 
-    # raw 3D coords
+    # raw 3-D coords
     coords = np.array([[lm.x, lm.y, lm.z] for lm in lms], dtype=np.float32)
 
-    # pose estimation (before normalization)
+    # pose estimation (on raw coords, before normalisation)
     yaw, pitch, roll = estimate_pose(lms)
 
-    # pose normalization
+    # pose normalisation
     coords_norm = normalize_pose(coords)
-    coord_feat  = coords_norm.flatten()   # 1434
+    coord_feat  = coords_norm.flatten()          # N_COORDS = 1434
 
-    # Laplacian spectrum
+    # distance ratio features (on normalised coords)
+    ratio_feat = distance_ratios(coords_norm)    # N_RATIOS = 50
+
+    # Laplacian spectrum (reuse cached value when available)
     if cached_spec is not None:
         spec = cached_spec
     else:
         G    = build_graph(face_landmarks)
         spec = laplacian_spectrum(G, k=N_SPECTRAL)
 
-    feat = np.concatenate([coord_feat, spec])   # 1484
+    feat = np.concatenate([coord_feat, ratio_feat, spec])  # FEAT_DIM = 1534
+    assert feat.shape[0] == FEAT_DIM, \
+        f"Feature dim mismatch: got {feat.shape[0]}, expected {FEAT_DIM}"
     return feat.astype(np.float32), yaw, pitch, roll
