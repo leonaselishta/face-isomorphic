@@ -4,3 +4,8 @@ node_modules/
 dist/
 build/
 *.log
+face_embeddings.csv
+face_data_backup.csv
+*_backup.csv
+nn_visualization.png
+spectrum_snapshot.png

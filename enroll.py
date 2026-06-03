@@ -1,29 +1,4 @@
-"""
-enroll.py  —  Guided multi-pose enrollment for maximum accuracy.
-
-Captures samples in 5 defined poses so the model has explicit coverage
-of the angle space:
-  1. Front       (look straight at camera)
-  2. Left  ~30°  (turn head left)
-  3. Right ~30°  (turn head right)
-  4. Up    ~15°  (tilt head up)
-  5. Down  ~15°  (tilt head down)
-
-60 samples per pose = 300 total per person.
-Each sample is also augmented with 2 jittered copies → 900 rows saved.
-
-The Laplacian spectrum is computed in a background thread so it never
-blocks the camera loop or causes missed keypresses.
-
-Usage:
-    python enroll.py
-    python enroll.py --name "Alice" --per-pose 60 --augment 2
-
-Controls:
-    SPACE  – toggle capturing on/off for the current pose
-    N      – skip to next pose
-    Q      – quit and save all collected data
-"""
+"""Guided enrollment for mesh features and optional InsightFace embeddings."""
 
 import cv2
 import mediapipe as mp
@@ -37,7 +12,11 @@ import queue
 
 from face_utils import (
     extract_features, build_graph,
-    laplacian_spectrum, N_SPECTRAL, N_COORDS, FEAT_DIM, SCHEMA_VER,
+    laplacian_spectrum, face_quality, landmark_bbox, pose_matches_target,
+    N_SPECTRAL, N_COORDS, FEAT_DIM, SCHEMA_VER,
+)
+from embedding_utils import (
+    EMBEDDING_DATA_FILE, EMBEDDING_DIM, FaceEmbedder, largest_face,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -59,6 +38,7 @@ POSES = [
 ]
 
 JITTER_SIGMA = 0.0015   # Gaussian noise sigma for augmentation
+MIN_REAL_SAMPLES_PER_PERSON = 120
 
 
 # ── background Laplacian worker (same pattern as recognize.py) ────────────────
@@ -136,7 +116,7 @@ def draw_progress(frame, collected, target, x, y, bar_w=280):
 
 def draw_overlay(frame, name, pose_idx, pose_name, instruction,
                  collected, per_pose, capturing, yaw, pitch, roll,
-                 face_found, spec_ready):
+                 face_found, spec_ready, quality_reason=""):
     h, w = frame.shape[:2]
 
     # dark banner at top
@@ -156,9 +136,12 @@ def draw_overlay(frame, name, pose_idx, pose_name, instruction,
     if not face_found:
         status_text  = "No face detected — move into frame"
         status_color = (0, 0, 255)
-    elif capturing:
+    elif capturing and quality_reason == "good":
         status_text  = "Capturing...  (SPACE=pause  N=next  Q=quit)"
         status_color = (0, 220, 0)
+    elif capturing:
+        status_text = f"Waiting: {quality_reason}"
+        status_color = (0, 165, 255)
     else:
         status_text  = "Ready — press SPACE to start  |  N=skip  Q=quit"
         status_color = (0, 165, 255)
@@ -181,6 +164,9 @@ def main():
     parser.add_argument("--per-pose", type=int, default=60)
     parser.add_argument("--augment",  type=int, default=2,
                         help="Jittered copies per real sample (0 = off)")
+    parser.add_argument("--backend", choices=("mesh", "embedding", "both"),
+                        default="both",
+                        help="Which enrollment data to save")
     args = parser.parse_args()
 
     if args.name:
@@ -192,8 +178,20 @@ def main():
 
     per_pose = args.per_pose
     n_aug    = max(0, args.augment)
-    all_rows = []
+    mesh_rows = []
+    embedding_rows = []
     rng      = np.random.default_rng(seed=None)
+    embedder = None
+
+    if args.backend in ("embedding", "both"):
+        try:
+            embedder = FaceEmbedder()
+            log.info("Embedding backend ready: InsightFace")
+        except RuntimeError as exc:
+            if args.backend == "embedding":
+                log.error(str(exc))
+                return
+            log.warning("%s; continuing with mesh enrollment only.", exc)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -212,12 +210,13 @@ def main():
             min_tracking_confidence=0.5,
         ) as face_mesh:
 
-            for pose_idx, (pose_name, instruction, _ty, _tp) in enumerate(POSES):
+            for pose_idx, (pose_name, instruction, target_yaw, target_pitch) in enumerate(POSES):
                 collected    = 0
                 capturing    = False
                 frame_n      = 0
                 cached_spec  = None
                 last_req_frm = -SPECTRAL_REQUEST_EVERY  # trigger immediately
+                quality_reason = ""
 
                 log.info(f"\nPose {pose_idx + 1}/{len(POSES)}: {pose_name}")
                 log.info(f"  → {instruction}")
@@ -238,6 +237,8 @@ def main():
 
                     face_found = results.multi_face_landmarks is not None
                     yaw = pitch = roll = 0.0
+                    quality_ok = False
+                    quality_reason = "no face"
 
                     if face_found:
                         lms = results.multi_face_landmarks[0]
@@ -256,12 +257,31 @@ def main():
                         try:
                             feat, yaw, pitch, roll = extract_features(
                                 lms, cached_spec)
+                            quality_ok, quality_reason, _metrics = face_quality(
+                                frame, lms, yaw, pitch, roll)
 
-                            if capturing:
-                                all_rows.append([name] + feat.tolist())
-                                for aug_feat in augment_feature(feat, rng, n_aug):
-                                    all_rows.append([name] + aug_feat.tolist())
+                            if not pose_matches_target(
+                                    yaw, pitch, target_yaw, target_pitch):
+                                quality_ok = False
+                                quality_reason = "match requested pose"
+
+                            if capturing and quality_ok:
+                                if args.backend in ("mesh", "both"):
+                                    mesh_rows.append([name] + feat.tolist())
+                                    for aug_feat in augment_feature(feat, rng, n_aug):
+                                        mesh_rows.append([name] + aug_feat.tolist())
+
+                                if embedder is not None:
+                                    emb_face = largest_face(embedder.extract(frame))
+                                    if emb_face is not None:
+                                        embedding_rows.append(
+                                            [name] + emb_face["embedding"].tolist())
+
                                 collected += 1
+
+                            x1, y1, x2, y2 = landmark_bbox(lms, w, h)
+                            color = (0, 220, 0) if quality_ok else (0, 165, 255)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
                         except Exception as exc:
                             log.warning("Feature extraction failed frame %d: %s",
@@ -272,7 +292,7 @@ def main():
                         frame, name, pose_idx, pose_name, instruction,
                         collected, per_pose, capturing,
                         yaw, pitch, roll,
-                        face_found, cached_spec is not None,
+                        face_found, cached_spec is not None, quality_reason,
                     )
 
                     cv2.imshow("Enroll", frame)
@@ -286,7 +306,8 @@ def main():
                         log.info(f"  Skipped pose (collected {collected})")
                         break
                     elif key == ord("q"):
-                        _save(all_rows, name, n_aug)
+                        _save_mesh(mesh_rows, name, n_aug)
+                        _save_embeddings(embedding_rows, name)
                         return
 
                 # auto-advance message
@@ -297,12 +318,13 @@ def main():
         lap_worker.stop()
         cap.release()
         cv2.destroyAllWindows()
-        _save(all_rows, name, n_aug)
+        _save_mesh(mesh_rows, name, n_aug)
+        _save_embeddings(embedding_rows, name)
 
 
-def _save(rows, name, n_aug):
+def _save_mesh(rows, name, n_aug):
     if not rows:
-        log.warning("No data collected — nothing saved.")
+        log.warning("No mesh data collected.")
         return
 
     n_features  = len(rows[0]) - 1
@@ -326,6 +348,36 @@ def _save(rows, name, n_aug):
     log.info(
         f"\nSaved {len(rows)} rows for '{name}' "
         f"({real_samples} real + {len(rows) - real_samples} augmented) → {DATA_FILE}"
+    )
+    if real_samples < MIN_REAL_SAMPLES_PER_PERSON:
+        log.warning(
+            "Only %d real mesh samples saved. Aim for at least %d per person.",
+            real_samples, MIN_REAL_SAMPLES_PER_PERSON)
+
+
+def _save_embeddings(rows, name):
+    if not rows:
+        log.warning("No embedding data collected.")
+        return
+
+    n_features = len(rows[0]) - 1
+    file_exists = os.path.isfile(EMBEDDING_DATA_FILE)
+    if n_features != EMBEDDING_DIM:
+        log.error(
+            f"Embedding dimension mismatch: got {n_features}, "
+            f"expected {EMBEDDING_DIM}."
+        )
+        return
+
+    with open(EMBEDDING_DATA_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            header = ["label_embedding_v1"] + [f"e{i}" for i in range(n_features)]
+            writer.writerow(header)
+        writer.writerows(rows)
+
+    log.info(
+        f"Saved {len(rows)} embedding rows for '{name}' → {EMBEDDING_DATA_FILE}"
     )
 
 

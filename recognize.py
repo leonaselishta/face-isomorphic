@@ -1,20 +1,4 @@
-"""
-recognize.py  —  Multi-face recognition with PCA + LDA pipeline.
-
-Accuracy features
------------------
-  1. Pose-normalised features  — face always "faces forward" before matching
-  2. Distance ratio features   — scale/rotation invariant geometry (50 values)
-  3. Laplacian spectrum        — graph-theoretic face topology (50 values)
-  4. PCA + LDA pipeline        — LDA maximises between-class separation,
-                                 making it much easier to tell two faces apart
-  5. Pose-gated confidence     — extreme angles show "?" instead of wrong name
-  6. Per-face smoothing        — 20-frame majority vote per tracked face
-  7. Background Laplacian      — eigenvalue computation runs off the main thread
-                                 so it never drops frames
-
-Controls:  Q = quit
-"""
+"""Live face recognition using either embeddings or the mesh classifier."""
 
 import cv2
 import mediapipe as mp
@@ -27,9 +11,10 @@ import queue
 from collections import deque
 
 from face_utils import (
-    extract_features, build_graph, laplacian_spectrum,
+    extract_features, build_graph, laplacian_spectrum, landmark_bbox,
     is_pose_extreme, N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER,
 )
+from embedding_utils import FaceEmbedder, l2_normalize
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -43,6 +28,7 @@ MAX_FACES      = 6
 SMOOTH_WINDOW  = 20
 SPECTRAL_EVERY = 10   # recompute Laplacian every N frames per face
 MLP_THRESHOLD  = 0.70  # lowered slightly; LDA space is more discriminative
+TRACK_IOU_THRESHOLD = 0.25
 
 # Pose limits — beyond these angles show "?" not a wrong name
 YAW_LIMIT   = 40
@@ -89,9 +75,29 @@ def predict(bundle, feat_d):
     proba = bundle["model"].predict_proba(feat_d.reshape(1, -1))[0]
     idx   = int(np.argmax(proba))
     conf  = float(proba[idx])
-    if conf >= MLP_THRESHOLD:
+    ordered = np.sort(proba)
+    margin = float(ordered[-1] - ordered[-2]) if len(ordered) > 1 else conf
+    conf_threshold = float(bundle.get("conf_threshold", MLP_THRESHOLD))
+    margin_threshold = float(bundle.get("margin_threshold", 0.0))
+    if conf >= conf_threshold and margin >= margin_threshold:
         return bundle["encoder"].classes_[idx], conf
     return "Unknown", conf
+
+
+def predict_embedding(bundle, embedding):
+    emb = l2_normalize(embedding)
+    centroids = bundle["centroids"]
+    scores = centroids @ emb
+    idx = int(np.argmax(scores))
+    best = float(scores[idx])
+    ordered = np.sort(scores)
+    margin = float(ordered[-1] - ordered[-2]) if len(ordered) > 1 else best
+    name = bundle["centroid_names"][idx]
+    threshold = float(bundle["thresholds"].get(name, 0.45))
+    margin_threshold = float(bundle.get("margin_threshold", 0.08))
+    if best >= threshold and margin >= margin_threshold:
+        return name, best
+    return "Unknown", best
 
 
 # ── background Laplacian worker ───────────────────────────────────────────────
@@ -166,6 +172,7 @@ class FaceSmoother:
         self.cached_spec = None
         self.spec_frame  = -999
         self.center      = None          # (cx, cy) in pixel coords
+        self.bbox        = None
         self._lap_worker = LaplacianWorker()
         self._lap_worker.start()
 
@@ -208,6 +215,19 @@ def face_center(lms, w, h):
     return float(np.mean(xs)), float(np.mean(ys))
 
 
+def bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0 else 0.0
+
+
 def match_smoother(smoothers, cx, cy, frame_w, frame_h, rel_thresh=0.15):
     """
     Match a detected face centre to an existing smoother.
@@ -226,6 +246,89 @@ def match_smoother(smoothers, cx, cy, frame_w, frame_h, rel_thresh=0.15):
     return best if best_d < max_dist else None
 
 
+def match_smoother_bbox(smoothers, bbox, cx, cy, frame_w, frame_h):
+    best, best_score = None, 0.0
+    for s in smoothers:
+        if s.bbox is None:
+            continue
+        score = bbox_iou(s.bbox, bbox)
+        if score > best_score:
+            best_score, best = score, s
+    if best is not None and best_score >= TRACK_IOU_THRESHOLD:
+        return best
+    return match_smoother(smoothers, cx, cy, frame_w, frame_h)
+
+
+def run_embedding_recognition(bundle):
+    try:
+        embedder = FaceEmbedder()
+    except RuntimeError as exc:
+        log.error(str(exc))
+        return
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        log.error("Cannot open camera. Check that no other app is using it.")
+        return
+
+    log.info("Mode: InsightFace embeddings + cosine thresholds")
+    log.info(f"Enrolled: {bundle['people']}\n")
+    smoothers = []
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        h, w = frame.shape[:2]
+        faces = embedder.extract(frame)
+        active_boxes = []
+
+        for face in faces:
+            x1, y1, x2, y2 = [int(v) for v in face["bbox"]]
+            bbox = (x1, y1, x2, y2)
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            active_boxes.append(bbox)
+
+            smoother = match_smoother_bbox(smoothers, bbox, cx, cy, w, h)
+            if smoother is None:
+                smoother = FaceSmoother()
+                smoothers.append(smoother)
+            smoother.center = (cx, cy)
+            smoother.bbox = bbox
+
+            name, conf = predict_embedding(bundle, face["embedding"])
+            smoother.update(name, conf)
+
+            label = smoother.label
+            conf_val = smoother.confidence
+            color = (0, 220, 0) if label not in ("Unknown", "...") else (0, 0, 220)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{label}  {conf_val * 100:.0f}%",
+                        (x1, max(24, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
+
+        smoothers = [
+            s for s in smoothers
+            if s.bbox is not None and any(
+                bbox_iou(s.bbox, box) >= TRACK_IOU_THRESHOLD for box in active_boxes
+            )
+        ]
+
+        cv2.putText(frame, f"Faces: {len(faces)} | embeddings | Q=quit",
+                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (100, 100, 100), 1)
+        cv2.imshow("Face Recognition - Embeddings", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    for s in smoothers:
+        s.stop()
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     if not os.path.isfile(MODEL_FILE):
@@ -233,6 +336,10 @@ def main():
         return
 
     bundle = joblib.load(MODEL_FILE)
+
+    if bundle.get("backend") == "embedding":
+        run_embedding_recognition(bundle)
+        return
 
     # schema version check
     model_ver = bundle.get("schema_ver", 1)
@@ -274,13 +381,15 @@ def main():
             if results.multi_face_landmarks:
                 for face_lms in results.multi_face_landmarks:
                     cx, cy = face_center(face_lms, w, h)
+                    bbox = landmark_bbox(face_lms, w, h)
                     active_centers.append((cx, cy))
 
-                    smoother = match_smoother(smoothers, cx, cy, w, h)
+                    smoother = match_smoother_bbox(smoothers, bbox, cx, cy, w, h)
                     if smoother is None:
                         smoother = FaceSmoother()
                         smoothers.append(smoother)
                     smoother.center = (cx, cy)
+                    smoother.bbox = bbox
 
                     # submit Laplacian computation to background thread
                     if frame_n - smoother.spec_frame >= SPECTRAL_EVERY:
@@ -321,11 +430,8 @@ def main():
                     except Exception as exc:
                         log.debug("Feature extraction error: %s", exc)
 
-                    # bounding box
-                    xs = [lm.x * w for lm in face_lms.landmark]
-                    ys = [lm.y * h for lm in face_lms.landmark]
-                    x1, y1 = int(min(xs)), int(min(ys))
-                    x2, y2 = int(max(xs)), int(max(ys))
+                    x1, y1, x2, y2 = landmark_bbox(face_lms, w, h)
+                    smoother.bbox = (x1, y1, x2, y2)
 
                     label    = smoother.label
                     conf_val = smoother.confidence

@@ -1,20 +1,7 @@
-"""
-face_utils.py  —  Shared feature extraction with pose normalization.
-
-Feature vector layout (1534 values total):
-  1434  pose-normalised landmark coordinates  (478 landmarks × 3)
-    50  distance ratio features               (scale/rotation invariant)
-    50  Laplacian eigenvalues                 (graph-theoretic topology)
-
-Constants exported so every module stays in sync:
-  N_SPECTRAL   = 50   (Laplacian eigenvalues)
-  N_RATIOS     = 50   (distance ratio features)
-  N_COORDS     = 1434 (landmark coordinates)
-  FEAT_DIM     = 1534 (total feature vector length)
-  SCHEMA_VER   = 2    (bump whenever feature layout changes)
-"""
+"""Shared MediaPipe mesh feature extraction, pose checks, and quality gates."""
 
 import logging
+import cv2
 import numpy as np
 import networkx as nx
 import mediapipe as mp
@@ -144,6 +131,70 @@ def is_pose_extreme(yaw, pitch, roll, yaw_limit=40, pitch_limit=30, roll_limit=2
     return (abs(yaw) > yaw_limit or
             abs(pitch) > pitch_limit or
             abs(roll) > roll_limit)
+
+
+def landmark_bbox(face_landmarks, frame_w, frame_h, pad=0):
+    """Return a clamped pixel bounding box for a MediaPipe face landmark set."""
+    xs = np.array([lm.x * frame_w for lm in face_landmarks.landmark])
+    ys = np.array([lm.y * frame_h for lm in face_landmarks.landmark])
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(frame_w - 1, int(xs.max()) + pad)
+    y2 = min(frame_h - 1, int(ys.max()) + pad)
+    return x1, y1, x2, y2
+
+
+def face_quality(frame_bgr, face_landmarks, yaw, pitch, roll,
+                 min_face_frac=0.10, min_blur=45.0,
+                 min_brightness=35.0, max_brightness=225.0,
+                 yaw_limit=42, pitch_limit=32, roll_limit=28):
+    """
+    Score whether a frame is worth saving for enrollment.
+
+    Returns (ok, reason, metrics). Rejecting bad enrollment frames usually helps
+    more than adding a larger classifier later.
+    """
+    h, w = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = landmark_bbox(face_landmarks, w, h, pad=4)
+    face_w = max(1, x2 - x1)
+    face_h = max(1, y2 - y1)
+    face_frac = (face_w * face_h) / float(w * h)
+
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return False, "bad crop", {"face_frac": face_frac}
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(gray.mean())
+
+    metrics = {
+        "face_frac": face_frac,
+        "blur": blur,
+        "brightness": brightness,
+        "yaw": yaw,
+        "pitch": pitch,
+        "roll": roll,
+    }
+
+    if face_frac < min_face_frac:
+        return False, "move closer", metrics
+    if blur < min_blur:
+        return False, "hold still", metrics
+    if brightness < min_brightness:
+        return False, "too dark", metrics
+    if brightness > max_brightness:
+        return False, "too bright", metrics
+    if is_pose_extreme(yaw, pitch, roll, yaw_limit, pitch_limit, roll_limit):
+        return False, "pose too extreme", metrics
+    return True, "good", metrics
+
+
+def pose_matches_target(yaw, pitch, target_yaw, target_pitch,
+                        yaw_tol=16, pitch_tol=13):
+    """Return True when the current head pose is close to the requested pose."""
+    return (abs(yaw - target_yaw) <= yaw_tol and
+            abs(pitch - target_pitch) <= pitch_tol)
 
 
 # ── pose normalization ────────────────────────────────────────────────────────

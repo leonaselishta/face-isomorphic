@@ -1,21 +1,4 @@
-"""
-train.py  —  Train face recognition on pose-normalised + ratio + spectral features.
-
-Pipeline
---------
-  1. Load features (1534-D: pose-normalised coords + distance ratios + Laplacian)
-  2. Upweight Laplacian features ×3, ratio features ×2
-  3. StandardScaler
-  4. PCA  → reduce to 95 % variance (capped at N_PCA_MAX)
-  5. LDA  → reduce to (n_classes - 1) dimensions  [multi-person only]
-  6. 1 person  → nearest-centroid with adaptive threshold
-     2+ people → MLP neural network on PCA+LDA space
-
-Usage
------
-    python train.py
-    python train.py --data face_data.csv --model face_model.pkl
-"""
+"""Train either the mesh classifier or the recommended embedding matcher."""
 
 import argparse
 import logging
@@ -30,9 +13,11 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.neural_network   import MLPClassifier
 from sklearn.model_selection  import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics          import classification_report
-from sklearn.pipeline         import Pipeline
 
 from face_utils import N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER
+from embedding_utils import (
+    EMBEDDING_DATA_FILE, EMBEDDING_DIM, l2_normalize,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -45,6 +30,9 @@ SPECTRAL_WEIGHT  = 3.0          # Laplacian eigenvalues upweighted ×3
 RATIO_WEIGHT     = 2.0          # distance ratios upweighted ×2
 THRESHOLD_PCTILE = 95
 THRESHOLD_FACTOR = 1.2
+EMBEDDING_THRESHOLD_FLOOR = 0.38
+EMBEDDING_MARGIN = 0.08
+CLEAN_PCA_COMPONENTS = 50
 
 
 # ── feature weighting ─────────────────────────────────────────────────────────
@@ -62,6 +50,33 @@ def apply_weights(X):
     X[:, ratio_start:ratio_end] *= RATIO_WEIGHT
     X[:, -N_SPECTRAL:]          *= SPECTRAL_WEIGHT
     return X
+
+
+def clean_mesh_rows(rows, percentile):
+    labels = [r[0] for r in rows]
+    X = np.array([r[1:] for r in rows], dtype=np.float32)
+    X_w = apply_weights(X)
+    X_scaled = StandardScaler().fit_transform(X_w)
+    n_comp = min(CLEAN_PCA_COMPONENTS, X_scaled.shape[0] - 1, X_scaled.shape[1])
+    X_pca = PCA(n_components=n_comp, random_state=42).fit_transform(X_scaled)
+
+    keep = np.ones(len(rows), dtype=bool)
+    for person in dict.fromkeys(labels):
+        idx = np.array([i for i, label in enumerate(labels) if label == person])
+        samples = X_pca[idx]
+        centroid = samples.mean(axis=0)
+        dists = np.linalg.norm(samples - centroid, axis=1)
+        cutoff = np.percentile(dists, percentile)
+        keep[idx[dists > cutoff]] = False
+        log.info(
+            "  %s: keeping %d/%d samples after cleaning",
+            person, int(keep[idx].sum()), len(idx))
+
+    cleaned = [row for row, keep_row in zip(rows, keep) if keep_row]
+    log.info(
+        "Cleaned mesh data: keeping %d/%d rows", len(cleaned), len(rows))
+
+    return cleaned
 
 
 # ── one-person mode ───────────────────────────────────────────────────────────
@@ -131,7 +146,98 @@ def train_multi(X_pca, labels, le, n_classes):
         log.info(f"Cross-val accuracy: {cv_scores.mean()*100:.1f}% "
                  f"± {cv_scores.std()*100:.1f}%")
 
-    return {"mode": "multi_person", "model": model, "encoder": le, "lda": lda}
+    proba = model.predict_proba(X_lda)
+    best = proba.max(axis=1)
+    ordered = np.sort(proba, axis=1)
+    margins = ordered[:, -1] - ordered[:, -2] if proba.shape[1] > 1 else best
+    conf_threshold = max(0.65, float(np.percentile(best, 10) * 0.95))
+    margin_threshold = max(0.05, float(np.percentile(margins, 10) * 0.80))
+    log.info(
+        "Unknown rejection: confidence >= %.2f and margin >= %.2f",
+        conf_threshold, margin_threshold)
+
+    return {
+        "mode": "multi_person",
+        "model": model,
+        "encoder": le,
+        "lda": lda,
+        "conf_threshold": conf_threshold,
+        "margin_threshold": margin_threshold,
+    }
+
+
+# ── embedding mode ────────────────────────────────────────────────────────────
+def train_embedding(data_file, model_file):
+    if not os.path.isfile(data_file):
+        log.error(f"{data_file} not found. Run enroll.py --backend embedding first.")
+        return
+
+    with open(data_file, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+
+    if not rows:
+        log.error("Embedding data file is empty.")
+        return
+
+    labels = np.array([r[0] for r in rows])
+    X = l2_normalize(np.array([r[1:] for r in rows], dtype=np.float32))
+    if X.shape[1] != EMBEDDING_DIM:
+        log.error(
+            f"Embedding dimension mismatch: CSV has {X.shape[1]}, "
+            f"expected {EMBEDDING_DIM}."
+        )
+        return
+
+    people = list(dict.fromkeys(labels.tolist()))
+    centroids = {}
+    thresholds = {}
+    log.info(f"Loaded {len(X)} embeddings, {len(people)} person(s): {people}")
+
+    for person in people:
+        samples = X[labels == person]
+        centroid = l2_normalize(samples.mean(axis=0))
+        sims = samples @ centroid
+        threshold = max(
+            EMBEDDING_THRESHOLD_FLOOR,
+            float(np.percentile(sims, 5) - 0.03),
+        )
+        centroids[person] = centroid.astype(np.float32)
+        thresholds[person] = threshold
+        log.info(
+            "  %s: %d samples | median cosine %.3f | threshold %.3f",
+            person, len(samples), float(np.median(sims)), threshold)
+
+    centroid_names = list(centroids)
+    centroid_matrix = np.stack([centroids[p] for p in centroid_names])
+    train_scores = X @ centroid_matrix.T
+    pred_idx = np.argmax(train_scores, axis=1)
+    pred = np.array([centroid_names[i] for i in pred_idx])
+    train_acc = float(np.mean(pred == labels))
+    log.info("Centroid training accuracy: %.1f%%", train_acc * 100)
+
+    if len(people) > 1:
+        same = train_scores[np.arange(len(X)), pred_idx]
+        sorted_scores = np.sort(train_scores, axis=1)
+        margins = sorted_scores[:, -1] - sorted_scores[:, -2]
+        log.info(
+            "Median best cosine %.3f | median identity margin %.3f",
+            float(np.median(same)), float(np.median(margins)))
+
+    bundle = {
+        "backend": "embedding",
+        "mode": "embedding_centroid",
+        "people": people,
+        "centroid_names": centroid_names,
+        "centroids": centroid_matrix.astype(np.float32),
+        "thresholds": thresholds,
+        "margin_threshold": EMBEDDING_MARGIN,
+        "embedding_dim": EMBEDDING_DIM,
+        "schema_ver": "embedding_v1",
+    }
+    joblib.dump(bundle, model_file)
+    log.info(f"\nEmbedding model saved → {model_file}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -139,7 +245,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data",  default=DATA_FILE)
     parser.add_argument("--model", default=MODEL_FILE)
+    parser.add_argument("--backend", choices=("mesh", "embedding"),
+                        default="mesh")
+    parser.add_argument("--embedding-data", default=EMBEDDING_DATA_FILE)
+    parser.add_argument("--clean-percentile", type=float,
+                        help="Drop per-person mesh outliers above this percentile")
     args = parser.parse_args()
+
+    if args.backend == "embedding":
+        train_embedding(args.embedding_data, args.model)
+        return
 
     if not os.path.isfile(args.data):
         log.error(f"{args.data} not found. Run enroll.py first.")
@@ -175,6 +290,13 @@ def main():
         )
         return
 
+    if args.clean_percentile is not None:
+        rows = clean_mesh_rows(rows, args.clean_percentile)
+        labels = np.array([r[0] for r in rows])
+        X = np.array([r[1:] for r in rows], dtype=np.float32)
+        unique_people = list(dict.fromkeys(labels.tolist()))
+        n_classes = len(unique_people)
+
     log.info(f"Loaded {len(X)} samples, {n_classes} person(s): {unique_people}")
     log.info(f"Features: {X.shape[1]}D  "
              f"(coords={N_COORDS}, ratios={N_RATIOS}, spectral={N_SPECTRAL})\n")
@@ -206,6 +328,7 @@ def main():
         bundle = train_multi(X_pca, labels, le, n_classes)
 
     bundle.update({
+        "backend":         "mesh",
         "scaler":          scaler,
         "pca":             pca,
         "spectral_weight": SPECTRAL_WEIGHT,
