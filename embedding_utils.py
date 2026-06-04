@@ -1,10 +1,4 @@
-import logging
-import os
-
-import cv2
 import numpy as np
-
-log = logging.getLogger(__name__)
 
 EMBEDDING_DATA_FILE = "face_embeddings.csv"
 EMBEDDING_DIM = 512
@@ -57,10 +51,6 @@ def l2_normalize(X):
     return X / np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-8)
 
 
-def cosine_similarity(a, b):
-    return float(np.dot(l2_normalize(a), l2_normalize(b)))
-
-
 def bbox_area(bbox):
     x1, y1, x2, y2 = bbox
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
@@ -70,7 +60,3 @@ def largest_face(faces):
     if not faces:
         return None
     return max(faces, key=lambda f: bbox_area(f["bbox"]))
-
-
-def embedding_data_exists(path=EMBEDDING_DATA_FILE):
-    return os.path.isfile(path)

@@ -7,13 +7,10 @@ import argparse
 import logging
 import os
 import csv
-import threading
-import queue
 
 from face_utils import (
-    extract_features, build_graph,
-    laplacian_spectrum, face_quality, landmark_bbox, pose_matches_target,
-    N_SPECTRAL, N_COORDS, FEAT_DIM, SCHEMA_VER,
+    extract_features, face_quality, landmark_bbox, pose_matches_target,
+    MeshLaplacianWorker, N_COORDS, FEAT_DIM, SCHEMA_VER,
 )
 from embedding_utils import (
     EMBEDDING_DATA_FILE, EMBEDDING_DIM, FaceEmbedder, largest_face,
@@ -39,55 +36,6 @@ POSES = [
 
 JITTER_SIGMA = 0.0015   # Gaussian noise sigma for augmentation
 MIN_REAL_SAMPLES_PER_PERSON = 120
-
-
-# ── background Laplacian worker (same pattern as recognize.py) ────────────────
-class LaplacianWorker(threading.Thread):
-    """Computes Laplacian eigenvalues off the main thread."""
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self._in_q  = queue.Queue(maxsize=1)
-        self._out_q = queue.Queue(maxsize=1)
-        self._stop  = threading.Event()
-        self.latest = None
-
-    def run(self):
-        while not self._stop.is_set():
-            try:
-                face_lms = self._in_q.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            try:
-                G    = build_graph(face_lms)
-                spec = laplacian_spectrum(G, k=N_SPECTRAL)
-                try:
-                    self._out_q.get_nowait()
-                except queue.Empty:
-                    pass
-                self._out_q.put(spec)
-            except Exception as exc:
-                log.debug("LaplacianWorker error: %s", exc)
-
-    def submit(self, face_lms):
-        try:
-            self._in_q.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._in_q.put_nowait(face_lms)
-        except queue.Full:
-            pass
-
-    def poll(self):
-        try:
-            self.latest = self._out_q.get_nowait()
-        except queue.Empty:
-            pass
-        return self.latest
-
-    def stop(self):
-        self._stop.set()
 
 
 # ── augmentation ──────────────────────────────────────────────────────────────
@@ -199,7 +147,7 @@ def main():
         return
 
     # start one shared background Laplacian worker for the whole session
-    lap_worker = LaplacianWorker()
+    lap_worker = MeshLaplacianWorker()
     lap_worker.start()
 
     try:

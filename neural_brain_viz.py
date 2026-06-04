@@ -1,4 +1,9 @@
-"""Open3D brain-style visualization for the face recognition model."""
+"""Open3D brain-style visualization for the face recognition model.
+
+Controls (shown in console on launch):
+  L  — toggle edge/link lines on or off
+  Q  — close the window
+"""
 
 import argparse
 import os
@@ -7,56 +12,118 @@ import joblib
 import numpy as np
 
 
-MODEL_FILE = "face_model.pkl"
+MODEL_FILE      = "face_model.pkl"
 EDGES_PER_LAYER = 320
-NODE_RADIUS = 0.18
+NODE_RADIUS     = 0.22
+Z_SPACING       = 4.0
+SPHERE_RES      = 1    # 1 = 80 tri/sphere (fast);  2 = 320 (smoother)
 
 
+# ── Open3D import ─────────────────────────────────────────────────────────────
 def require_open3d():
     try:
         import open3d as o3d
     except ImportError as exc:
         raise SystemExit(
-            "Open3D is not installed. Install it with:\n"
-            "  pip install open3d\n"
-            "Then run this script again."
+            "Open3D is not installed.\n  pip install open3d"
         ) from exc
     return o3d
 
 
+# ── node positions ────────────────────────────────────────────────────────────
 def layer_offsets(layers):
-    offsets = []
-    total = 0
+    offsets, total = [], 0
     for size in layers:
         offsets.append(total)
         total += size
     return offsets
 
 
-def build_nodes(layers, z_spacing=4.0):
+def build_nodes(layers, z_spacing=Z_SPACING):
     nodes = []
     for li, size in enumerate(layers):
-        side = int(np.ceil(np.sqrt(size)))
+        side     = int(np.ceil(np.sqrt(size)))
         x_center = (side - 1) / 2.0
         y_center = (side - 1) / 2.0
-        z = li * z_spacing
+        z        = li * z_spacing
         for i in range(size):
             nodes.append([i % side - x_center, i // side - y_center, z])
     return np.asarray(nodes, dtype=np.float64)
 
 
+# ── node colors — professional cool-to-warm gradient ─────────────────────────
+# Deep navy (input) → steel blue → slate → warm silver (output).
+# Desaturated, muted tones that look clean against a dark background.
+_LAYER_PALETTE = [
+    (0.18, 0.35, 0.62),   # deep navy blue    — input
+    (0.25, 0.52, 0.78),   # steel blue
+    (0.35, 0.65, 0.82),   # sky blue
+    (0.45, 0.72, 0.76),   # teal-blue
+    (0.58, 0.76, 0.70),   # sage
+    (0.72, 0.78, 0.65),   # warm sage
+    (0.86, 0.80, 0.58),   # warm sand
+    (0.92, 0.72, 0.48),   # soft amber       — output
+]
+
+
+def node_colors_for_layers(layers):
+    """
+    Interpolate smoothly through _LAYER_PALETTE across all layers.
+    Every node in a layer shares the same color.
+    """
+    n      = len(layers)
+    pal    = np.asarray(_LAYER_PALETTE, dtype=np.float64)
+    colors = []
+    for li, size in enumerate(layers):
+        t     = li / max(n - 1, 1)                # 0.0 … 1.0
+        idx_f = t * (len(pal) - 1)
+        lo    = int(idx_f)
+        hi    = min(lo + 1, len(pal) - 1)
+        frac  = idx_f - lo
+        color = (1.0 - frac) * pal[lo] + frac * pal[hi]
+        colors.extend([color.tolist()] * size)
+    return np.asarray(colors, dtype=np.float64)
+
+
+# ── sphere mesh (single merged mesh for speed) ────────────────────────────────
+def make_sphere_mesh(o3d, nodes, colors, radius, subdivision=SPHERE_RES):
+    template = o3d.geometry.TriangleMesh.create_icosahedron(radius=radius)
+    template = template.subdivide_midpoint(number_of_iterations=subdivision)
+    t_verts  = np.asarray(template.vertices)
+    t_tris   = np.asarray(template.triangles)
+    nv, nt   = len(t_verts), len(t_tris)
+    nn       = len(nodes)
+
+    all_verts  = np.empty((nn * nv, 3), dtype=np.float64)
+    all_tris   = np.empty((nn * nt, 3), dtype=np.int32)
+    all_colors = np.empty((nn * nv, 3), dtype=np.float64)
+
+    for i, (center, color) in enumerate(zip(nodes, colors)):
+        v0 = i * nv;  t0 = i * nt
+        all_verts [v0:v0+nv] = t_verts + center
+        all_tris  [t0:t0+nt] = t_tris  + v0
+        all_colors[v0:v0+nv] = color
+
+    mesh             = o3d.geometry.TriangleMesh()
+    mesh.vertices    = o3d.utility.Vector3dVector(all_verts)
+    mesh.triangles   = o3d.utility.Vector3iVector(all_tris)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(
+        np.clip(all_colors, 0.0, 1.0))
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+# ── edge helpers ──────────────────────────────────────────────────────────────
 def build_strongest_edges(weights, layers, edges_per_layer, start_layer=0):
-    offsets = layer_offsets(layers)
-    line_chunks = []
+    offsets      = layer_offsets(layers)
+    line_chunks  = []
     color_chunks = []
 
     for li, weight_matrix in enumerate(weights):
         layer_idx = start_layer + li
-        # scikit-learn MLP stores weights as (input_neurons, output_neurons).
-        flat_abs = np.abs(weight_matrix).ravel()
+        flat_abs  = np.abs(weight_matrix).ravel()
         if flat_abs.size == 0:
             continue
-
         k = min(int(edges_per_layer), flat_abs.size)
         if k < flat_abs.size:
             pick = np.argpartition(-flat_abs, k - 1)[:k]
@@ -65,67 +132,65 @@ def build_strongest_edges(weights, layers, edges_per_layer, start_layer=0):
             pick = np.argsort(-flat_abs)
 
         src, dst = np.unravel_index(pick, weight_matrix.shape)
-        lines = np.column_stack([
-            offsets[layer_idx] + src,
+        line_chunks.append(np.column_stack([
+            offsets[layer_idx]     + src,
             offsets[layer_idx + 1] + dst,
-        ])
-        line_chunks.append(lines)
-
+        ]))
         signed = weight_matrix.ravel()[pick]
-        colors = np.zeros((len(pick), 3), dtype=np.float64)
-        colors[signed >= 0] = (0.22, 0.82, 0.98)
-        colors[signed < 0] = (0.98, 0.48, 0.42)
-        color_chunks.append(colors * 0.55)
+        c = np.zeros((len(pick), 3), dtype=np.float64)
+        c[signed >= 0] = (0.45, 0.65, 0.90)   # cool blue  — positive weight
+        c[signed <  0] = (0.90, 0.45, 0.38)   # muted rose — negative weight
+        color_chunks.append(c * 0.50)
 
     if not line_chunks:
-        return (
-            np.zeros((0, 2), dtype=np.int32),
-            np.zeros((0, 3), dtype=np.float64),
-        )
-
-    return (
-        np.vstack(line_chunks).astype(np.int32),
-        np.vstack(color_chunks),
-    )
+        return (np.zeros((0, 2), dtype=np.int32),
+                np.zeros((0, 3), dtype=np.float64))
+    return (np.vstack(line_chunks).astype(np.int32),
+            np.vstack(color_chunks))
 
 
 def pseudo_edges(layers, edges_per_layer):
     offsets = layer_offsets(layers)
-    rng = np.random.default_rng(42)
-    chunks = []
-    colors = []
+    rng     = np.random.default_rng(42)
+    chunks, colors = [], []
     for li, (left, right) in enumerate(zip(layers[:-1], layers[1:])):
-        k = min(edges_per_layer, left * right)
-        src = rng.integers(0, left, size=k)
+        k   = min(edges_per_layer, left * right)
+        src = rng.integers(0, left,  size=k)
         dst = rng.integers(0, right, size=k)
-        chunks.append(np.column_stack([offsets[li] + src, offsets[li + 1] + dst]))
-        color = np.array([[0.35, 0.62, 0.90]], dtype=np.float64)
-        colors.append(np.repeat(color, k, axis=0) * 0.45)
+        chunks.append(
+            np.column_stack([offsets[li] + src, offsets[li + 1] + dst]))
+        colors.append(np.full((k, 3), [0.30, 0.45, 0.62], dtype=np.float64))
     return np.vstack(chunks).astype(np.int32), np.vstack(colors)
 
 
 def pseudo_edges_for_range(layers, edges_per_layer, start_layer, end_layer):
     offsets = layer_offsets(layers)
-    rng = np.random.default_rng(42)
-    chunks = []
-    colors = []
+    rng     = np.random.default_rng(42)
+    chunks, colors = [], []
     for li in range(start_layer, end_layer):
         left, right = layers[li], layers[li + 1]
-        k = min(edges_per_layer, left * right)
-        src = rng.integers(0, left, size=k)
+        k   = min(edges_per_layer, left * right)
+        src = rng.integers(0, left,  size=k)
         dst = rng.integers(0, right, size=k)
-        chunks.append(np.column_stack([offsets[li] + src, offsets[li + 1] + dst]))
-        color = np.array([[0.35, 0.62, 0.90]], dtype=np.float64)
-        colors.append(np.repeat(color, k, axis=0) * 0.35)
-
+        chunks.append(
+            np.column_stack([offsets[li] + src, offsets[li + 1] + dst]))
+        colors.append(np.full((k, 3), [0.28, 0.40, 0.58], dtype=np.float64))
     if not chunks:
-        return (
-            np.zeros((0, 2), dtype=np.int32),
-            np.zeros((0, 3), dtype=np.float64),
-        )
+        return (np.zeros((0, 2), dtype=np.int32),
+                np.zeros((0, 3), dtype=np.float64))
     return np.vstack(chunks).astype(np.int32), np.vstack(colors)
 
 
+def build_lineset(o3d, nodes, lines, line_colors):
+    ls        = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(nodes)
+    ls.lines  = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(
+        np.clip(line_colors * 0.28, 0.0, 1.0))
+    return ls
+
+
+# ── architecture helpers ──────────────────────────────────────────────────────
 def architecture(bundle):
     if bundle.get("backend") == "embedding":
         people = bundle.get("people", [])
@@ -135,16 +200,17 @@ def architecture(bundle):
             "weights": None,
             "note": "No MLP weights: showing embedding comparison pipeline.",
         }
-
     if bundle.get("mode") == "multi_person":
-        model = bundle["model"]
+        model    = bundle["model"]
         feat_dim = int(bundle.get("feat_dim", 1534))
-        pca_dim = int(getattr(bundle.get("pca"), "n_components_", model.coefs_[0].shape[0]))
-        layers = [feat_dim, pca_dim]
+        pca_dim  = int(getattr(bundle.get("pca"), "n_components_",
+                               model.coefs_[0].shape[0]))
+        layers   = [feat_dim, pca_dim]
         if bundle.get("use_lda", "lda" in bundle):
             layers.append(int(model.coefs_[0].shape[0]))
         layers.extend(int(c.shape[1]) for c in model.coefs_)
-        path = "PCA + LDA + MLP" if bundle.get("use_lda", "lda" in bundle) else "PCA + MLP"
+        path = ("PCA + LDA + MLP" if bundle.get("use_lda", "lda" in bundle)
+                else "PCA + MLP")
         return {
             "title": "Mesh MLP neural network",
             "layers": layers,
@@ -152,114 +218,118 @@ def architecture(bundle):
             "weight_start_layer": 2 if bundle.get("use_lda", "lda" in bundle) else 1,
             "note": f"{path}. Showing strongest learned MLP connections.",
         }
-
     feat_dim = int(bundle.get("feat_dim", 1534))
-    pca_dim = int(bundle["centroid"].shape[0])
+    pca_dim  = int(bundle["centroid"].shape[0])
     return {
         "title": "Single-person centroid pipeline",
         "layers": [feat_dim, pca_dim, 1],
         "weights": None,
-        "note": (
-            "No neural network exists for one-person mode. Showing pipeline "
-            "nodes with sampled conceptual links."
-        ),
+        "note": "No neural network: showing conceptual pipeline links.",
     }
 
 
 def demo_architecture(num_people=2):
-    layers = [1534, 200, 512, 256, 128, 64, int(num_people)]
     return {
         "title": "Demo multi-person mesh neural network",
-        "layers": layers,
+        "layers": [1534, 200, 512, 256, 128, 64, int(num_people)],
         "weights": None,
-        "note": (
-            "Demo only: this shows the new default PCA + MLP architecture without "
-            "changing face_model.pkl. Links are sampled conceptual links, not "
-            "trained weights."
-        ),
+        "note": "Demo only — links are conceptual, not trained weights.",
     }
 
 
-def node_colors_for_layers(layers):
-    colors = []
-    denom = max(len(layers) - 1, 1)
-    for li, size in enumerate(layers):
-        t = li / denom
-        color = [0.18 + t * 0.55, 0.52, 1.0 - t * 0.45]
-        colors.extend([color] * size)
-    return np.asarray(colors, dtype=np.float64)
-
-
-def make_spheres(o3d, nodes, colors, radius):
-    spheres = []
-    for point, color in zip(nodes, colors):
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
-        sphere.compute_vertex_normals()
-        sphere.translate(point)
-        sphere.paint_uniform_color(color)
-        spheres.append(sphere)
-    return spheres
-
-
+# ── console summary ───────────────────────────────────────────────────────────
 def print_summary(info, edges_per_layer):
     layers = info["layers"]
-    links = [a * b for a, b in zip(layers[:-1], layers[1:])]
-    print("\n" + info["title"])
+    links  = [a * b for a, b in zip(layers[:-1], layers[1:])]
+    print()
+    print("=" * 55)
+    print(info["title"])
     print(info["note"])
-    print("Layers:", " -> ".join(f"{n:,}" for n in layers))
-    print("Total nodes:", f"{sum(layers):,}")
-    print("Total possible links:", f"{sum(links):,}")
-    print("Visible links per layer pair:", f"{edges_per_layer:,}")
-    print("Controls: use the Open3D window to rotate, zoom, and pan.\n")
+    print("-" * 55)
+    print("Layers      :", " -> ".join(f"{n:,}" for n in layers))
+    print("Total nodes :", f"{sum(layers):,}")
+    print("Total links :", f"{sum(links):,}")
+    print("Shown/layer :", f"{edges_per_layer:,}")
+    print("-" * 55)
+    print("L — toggle edges    Q — quit")
+    print("Mouse: rotate / scroll-zoom / right-drag pan")
+    print("=" * 55)
+    print()
 
 
+# ── main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=MODEL_FILE)
-    parser.add_argument("--edges-per-layer", type=int, default=EDGES_PER_LAYER)
-    parser.add_argument("--node-radius", type=float, default=NODE_RADIUS)
-    parser.add_argument("--demo-mlp", action="store_true",
-                        help="Show a demo multi-person MLP without loading a model")
-    parser.add_argument("--demo-people", type=int, default=2,
-                        help="Number of output people/classes for --demo-mlp")
+    parser.add_argument("--model",           default=MODEL_FILE)
+    parser.add_argument("--edges-per-layer", type=int,   default=EDGES_PER_LAYER)
+    parser.add_argument("--node-radius",     type=float, default=NODE_RADIUS)
+    parser.add_argument("--sphere-res",      type=int,   default=SPHERE_RES,
+                        help="Ico-sphere subdivisions: 1=fast (default)  2=smooth")
+    parser.add_argument("--demo-mlp",        action="store_true")
+    parser.add_argument("--demo-people",     type=int,   default=2)
     args = parser.parse_args()
 
     if not args.demo_mlp and not os.path.isfile(args.model):
-        raise SystemExit(f"{args.model} not found. Run train.py first.")
+        raise SystemExit(f"{args.model} not found.  Run train.py first.")
 
     o3d = require_open3d()
+
     if args.demo_mlp:
         info = demo_architecture(args.demo_people)
     else:
         bundle = joblib.load(args.model)
-        info = architecture(bundle)
-    layers = info["layers"]
-    nodes = build_nodes(layers)
+        info   = architecture(bundle)
+
+    layers      = info["layers"]
+    nodes       = build_nodes(layers)
     node_colors = node_colors_for_layers(layers)
 
     if info["weights"] is None:
         lines, line_colors = pseudo_edges(layers, args.edges_per_layer)
     else:
-        start_layer = int(info.get("weight_start_layer", 0))
-        pre_lines, pre_colors = pseudo_edges_for_range(
-            layers, args.edges_per_layer, 0, start_layer)
-        mlp_lines, mlp_colors = build_strongest_edges(
+        start  = int(info.get("weight_start_layer", 0))
+        pl, pc = pseudo_edges_for_range(layers, args.edges_per_layer, 0, start)
+        ml, mc = build_strongest_edges(
             info["weights"], layers, args.edges_per_layer,
-            start_layer=start_layer)
-        lines = np.vstack([pre_lines, mlp_lines])
-        line_colors = np.vstack([pre_colors, mlp_colors])
+            start_layer=start)
+        lines       = np.vstack([pl, ml])
+        line_colors = np.vstack([pc, mc])
 
-    line_set = o3d.geometry.LineSet()
-    line_set.points = o3d.utility.Vector3dVector(nodes)
-    line_set.lines = o3d.utility.Vector2iVector(lines)
-    line_set.colors = o3d.utility.Vector3dVector(np.clip(line_colors, 0.0, 1.0))
+    sphere_mesh  = make_sphere_mesh(
+        o3d, nodes, node_colors, args.node_radius, args.sphere_res)
+    edge_lineset = build_lineset(o3d, nodes, lines, line_colors)
 
-    spheres = make_spheres(o3d, nodes, node_colors, args.node_radius)
     print_summary(info, args.edges_per_layer)
-    o3d.visualization.draw_geometries(
-        spheres + [line_set],
-        window_name="Face Model Brain Visualization",
-    )
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name="Face Model Brain Visualization",
+                      width=1400, height=900)
+
+    vis.add_geometry(edge_lineset)
+    vis.add_geometry(sphere_mesh)
+
+    opt = vis.get_render_option()
+    opt.background_color    = np.array([0.05, 0.06, 0.10])  # dark charcoal-blue
+    opt.light_on            = True
+    opt.mesh_show_back_face = True
+
+    state = {"edges_visible": True}
+
+    def toggle_edges(vis_ref):
+        state["edges_visible"] = not state["edges_visible"]
+        if state["edges_visible"]:
+            vis_ref.add_geometry(edge_lineset, reset_bounding_box=False)
+            print("Edges: ON")
+        else:
+            vis_ref.remove_geometry(edge_lineset, reset_bounding_box=False)
+            print("Edges: OFF")
+        vis_ref.update_renderer()
+        return False
+
+    vis.register_key_callback(76, toggle_edges)   # L
+
+    vis.run()
+    vis.destroy_window()
 
 
 if __name__ == "__main__":

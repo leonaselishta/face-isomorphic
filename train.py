@@ -189,7 +189,7 @@ def train_embedding(data_file, model_file):
 
     with open(data_file, newline="") as f:
         reader = csv.reader(f)
-        header = next(reader)
+        next(reader)
         rows = list(reader)
 
     if not rows:

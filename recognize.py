@@ -6,13 +6,11 @@ import numpy as np
 import joblib
 import os
 import logging
-import threading
-import queue
 from collections import deque
 
 from face_utils import (
-    extract_features, build_graph, laplacian_spectrum, landmark_bbox,
-    is_pose_extreme, N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER,
+    extract_features, landmark_bbox, is_pose_extreme, MeshLaplacianWorker,
+    N_SPECTRAL, N_RATIOS, N_COORDS, SCHEMA_VER,
 )
 from embedding_utils import FaceEmbedder, l2_normalize
 
@@ -100,97 +98,41 @@ def predict_embedding(bundle, embedding):
     return "Unknown", best
 
 
-# ── background Laplacian worker ───────────────────────────────────────────────
-class LaplacianWorker(threading.Thread):
-    """
-    Computes Laplacian eigenvalues in a background thread so the main
-    video loop is never blocked by the O(n³) eigensolver.
-
-    Usage:
-        worker = LaplacianWorker()
-        worker.start()
-        worker.submit(face_landmarks)   # non-blocking
-        spec = worker.latest            # None until first result arrives
-        worker.stop()
-    """
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self._in_q  = queue.Queue(maxsize=1)   # drop old requests
-        self._out_q = queue.Queue(maxsize=1)
-        self._stop  = threading.Event()
-        self.latest = None
-
-    def run(self):
-        while not self._stop.is_set():
-            try:
-                face_lms = self._in_q.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            try:
-                G    = build_graph(face_lms)
-                spec = laplacian_spectrum(G, k=N_SPECTRAL)
-                # keep only the most recent result
-                try:
-                    self._out_q.get_nowait()
-                except queue.Empty:
-                    pass
-                self._out_q.put(spec)
-            except Exception as exc:
-                log.debug("LaplacianWorker error: %s", exc)
-
-    def submit(self, face_lms):
-        """Submit new landmarks; silently drops if worker is busy."""
-        try:
-            self._in_q.get_nowait()   # discard stale request
-        except queue.Empty:
-            pass
-        try:
-            self._in_q.put_nowait(face_lms)
-        except queue.Full:
-            pass
-
-    def poll(self):
-        """Return the latest computed spectrum, or None."""
-        try:
-            self.latest = self._out_q.get_nowait()
-        except queue.Empty:
-            pass
-        return self.latest
-
-    def stop(self):
-        self._stop.set()
-
-
 # ── per-face state ────────────────────────────────────────────────────────────
 class FaceSmoother:
     """Tracks identity and confidence for one face across frames."""
 
-    def __init__(self):
+    def __init__(self, use_laplacian=True):
         self.names       = deque(maxlen=SMOOTH_WINDOW)
         self.confs       = deque(maxlen=SMOOTH_WINDOW)
         self.cached_spec = None
         self.spec_frame  = -999
         self.center      = None          # (cx, cy) in pixel coords
         self.bbox        = None
-        self._lap_worker = LaplacianWorker()
-        self._lap_worker.start()
+        self._lap_worker = MeshLaplacianWorker() if use_laplacian else None
+        if self._lap_worker is not None:
+            self._lap_worker.start()
 
     def update(self, name, conf):
         self.names.append(name)
         self.confs.append(conf)
 
     def submit_laplacian(self, face_lms):
+        if self._lap_worker is None:
+            return
         self._lap_worker.submit(face_lms)
 
     def poll_laplacian(self):
+        if self._lap_worker is None:
+            return self.cached_spec
         spec = self._lap_worker.poll()
         if spec is not None:
             self.cached_spec = spec
         return self.cached_spec
 
     def stop(self):
-        self._lap_worker.stop()
+        if self._lap_worker is not None:
+            self._lap_worker.stop()
 
     @property
     def label(self):
@@ -292,7 +234,7 @@ def run_embedding_recognition(bundle):
 
             smoother = match_smoother_bbox(smoothers, bbox, cx, cy, w, h)
             if smoother is None:
-                smoother = FaceSmoother()
+                smoother = FaceSmoother(use_laplacian=False)
                 smoothers.append(smoother)
             smoother.center = (cx, cy)
             smoother.bbox = bbox

@@ -1,6 +1,9 @@
 """Shared MediaPipe mesh feature extraction, pose checks, and quality gates."""
 
 import logging
+import queue
+import threading
+
 import cv2
 import numpy as np
 import networkx as nx
@@ -290,6 +293,53 @@ def laplacian_spectrum(G, k=N_SPECTRAL):
     if len(eigs) < k:
         eigs = np.pad(eigs, (0, k - len(eigs)))
     return eigs.astype(np.float32)
+
+
+class MeshLaplacianWorker(threading.Thread):
+    """Compute Laplacian eigenvalues off the camera/UI thread."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._in_q = queue.Queue(maxsize=1)
+        self._out_q = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self.latest = None
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                face_lms = self._in_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                spec = laplacian_spectrum(build_graph(face_lms), k=N_SPECTRAL)
+                try:
+                    self._out_q.get_nowait()
+                except queue.Empty:
+                    pass
+                self._out_q.put(spec)
+            except Exception as exc:
+                log.debug("MeshLaplacianWorker error: %s", exc)
+
+    def submit(self, face_lms):
+        try:
+            self._in_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._in_q.put_nowait(face_lms)
+        except queue.Full:
+            pass
+
+    def poll(self):
+        try:
+            self.latest = self._out_q.get_nowait()
+        except queue.Empty:
+            pass
+        return self.latest
+
+    def stop(self):
+        self._stop_event.set()
 
 
 # ── full feature extraction ───────────────────────────────────────────────────
