@@ -1,5 +1,5 @@
 opencv-python==4.8.1.78
-mediapipe==0.10.9
+mediapipe==0.10.14
 numpy==1.26.4
 scikit-learn==1.7.2
 joblib==1.5.3
@@ -8,5 +8,5 @@ matplotlib==3.10.9
 scipy==1.13.1
 onnxruntime==1.18.1
 onnx==1.18.0
-insightface==0.7.3
+# insightface==0.7.3  # requires Microsoft C++ Build Tools to compile
 open3d==0.18.0
