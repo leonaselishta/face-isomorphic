@@ -1,92 +1,151 @@
 # face-isomorphic
 
-Face recognition with two backends:
+Face recognition from a webcam. The project can run in two modes:
 
-- **Embedding backend (recommended):** InsightFace/ArcFace-style 512-D face
-  embeddings with cosine thresholds.
-- **Mesh backend:** MediaPipe's 478-landmark face mesh plus graph features.
+- **Mesh backend:** uses MediaPipe Face Mesh landmarks, handcrafted geometry
+  features, PCA/LDA, and a scikit-learn classifier. This is the default and the
+  easiest mode to run on Windows.
+- **Embedding backend:** uses InsightFace embeddings for stronger recognition.
+  This is optional because `insightface` can require extra build tools.
 
-## How it works
+## Project Flow
 
-Each face is represented as a **1534-dimensional feature vector**:
-
-| Slice | Content | Size |
-|---|---|---|
-| `[0:1434]` | Pose-normalised 3-D landmark coordinates (478 × 3) | 1434 |
-| `[1434:1484]` | Distance ratio features (scale/rotation invariant) | 50 |
-| `[1484:1534]` | Laplacian eigenvalues of the face mesh graph | 50 |
-
-The mesh training pipeline is **StandardScaler → PCA → LDA → MLP**:
-- **PCA** removes noise and reduces dimensionality (keeps 97% variance)
-- **LDA** (Linear Discriminant Analysis) maximises the separation *between* enrolled people — this is what makes multi-face recognition accurate
-- **MLP** is the final classifier
-
-## Workflow
-
-```
-1. Enroll one or more people
-   python enroll.py --name "Alice"
-   python enroll.py --name "Bob"
-
-2. Train the recommended embedding model
-   python train.py --backend embedding
-
-3. Run recognition
-   python recognize.py
+```text
+enroll.py    -> collect face samples
+train.py     -> train and save face_model.pkl
+recognize.py -> run live webcam recognition
 ```
 
-For the original graph/mesh model, train with optional outlier cleaning:
+MediaPipe detects the face landmarks. The actual recognition/comparison is done
+by the saved project model, `face_model.pkl`.
 
-```
-python train.py --backend mesh --clean-percentile 90
-```
+## Current Files
 
-## Scripts
-
-| Script | Purpose |
+| File | Purpose |
 |---|---|
-| `enroll.py` | Guided 5-pose enrollment with blur/lighting/pose quality gates |
-| `train.py` | Train embedding thresholds or the PCA + LDA + MLP mesh pipeline |
-| `recognize.py` | Live multi-face recognition with embedding or mesh backend |
+| `enroll.py` | Opens the webcam and records face samples for a named person. It checks blur, lighting, face size, and pose before saving samples. |
+| `train.py` | Trains `face_model.pkl` from the saved samples. Mesh mode uses StandardScaler, PCA, LDA, and MLP when there are 2+ people. |
+| `recognize.py` | Opens the webcam, detects faces, extracts features, and predicts a name or `Unknown`. |
+| `face_utils.py` | Shared MediaPipe mesh feature extraction, pose estimation, quality checks, and graph features. |
+| `embedding_utils.py` | Optional InsightFace embedding support. |
+| `neural_brain_viz.py` | Open3D 3D viewer for the model/pipeline nodes and sampled/strongest connections. |
+| `face_data.csv` | Saved enrollment data for mesh mode. |
+| `face_model.pkl` | Trained recognition model. |
+| `shpjegim_kodi.txt` | Albanian explanation of the code. |
 
-## Controls
+## Setup
 
-**enroll.py**
-- `SPACE` — start/pause capturing
-- `N` — skip to next pose
-- `Q` — quit and save
+Create and activate a virtual environment:
 
-**recognize.py**
-- `Q` — quit
-
-## Requirements
-
-```
+```powershell
 python -m venv venv
 venv\Scripts\activate
+```
+
+Install the base dependencies:
+
+```powershell
 pip install -r requirements.txt
 ```
 
-For the stronger embedding backend, install the optional dependencies too:
+This installs the mesh backend, embedding backend, and Open3D visualization
+dependencies in one step.
 
+## Mesh Backend Commands
+
+Enroll at least two people if you want the model to tell faces apart:
+
+```powershell
+python enroll.py --name "Alice" --backend mesh
+python enroll.py --name "Bob" --backend mesh
 ```
-pip install -r requirements-embedding.txt
+
+Train the mesh model:
+
+```powershell
+python train.py --backend mesh --clean-percentile 90
 ```
 
-On Windows, `insightface` may require Microsoft C++ Build Tools. If that install
-fails, the mesh backend still works with the base requirements.
+Run live recognition:
 
-## Re-enrolling after code changes
+```powershell
+python recognize.py
+```
 
-If `face_utils.py` changes (feature layout), you must re-enroll and retrain.
-The schema version (`SCHEMA_VER`) is embedded in the CSV header and model bundle
-so mismatches are detected automatically.
+Press `Q` to quit the webcam window.
 
-## Accuracy tips
+## Embedding Backend Commands
 
-- Enroll every person you want to distinguish; one-person data can only learn
-  "known person" vs "Unknown".
-- Use the embedding backend for best identity separation.
-- Enroll each person in similar lighting to the recognition environment.
-- Keep classes balanced: roughly the same number of accepted samples per person.
-- Re-enroll when changing cameras, camera distance, or lighting significantly.
+If the InsightFace install works:
+
+```powershell
+python enroll.py --name "Alice" --backend embedding
+python enroll.py --name "Bob" --backend embedding
+python train.py --backend embedding
+python recognize.py
+```
+
+If `insightface` fails to install on Windows, use the mesh backend instead.
+
+## How The Mesh Model Works
+
+For each detected face, `face_utils.py` creates a 1534-value vector:
+
+| Slice | Content | Size |
+|---|---|---|
+| `0:1434` | Pose-normalized 3D coordinates from 478 MediaPipe landmarks | 1434 |
+| `1434:1484` | Distance-ratio geometry features | 50 |
+| `1484:1534` | Laplacian graph spectrum features | 50 |
+
+Training then applies:
+
+```text
+feature weights -> StandardScaler -> PCA -> LDA -> MLPClassifier
+```
+
+Important behavior:
+
+- With **one enrolled person**, the project does not train a neural network. It
+  uses a centroid threshold: known person vs `Unknown`.
+- With **two or more enrolled people**, `train.py` trains an MLP neural network.
+  The hidden layers are fixed at `512 -> 256 -> 128 -> 64`.
+- The output layer grows with the number of enrolled people.
+
+## 3D Model Visualization
+
+Run:
+
+```powershell
+python neural_brain_viz.py
+```
+
+The viewer shows all nodes in the displayed architecture. It does **not** show
+all possible connections, because that can be hundreds of thousands of lines.
+Instead:
+
+- multi-person MLP mode shows the strongest learned connections
+- one-person centroid mode shows sampled conceptual pipeline links
+- embedding mode shows the embedding comparison pipeline
+
+Useful options:
+
+```powershell
+python neural_brain_viz.py --edges-per-layer 150
+python neural_brain_viz.py --node-radius 0.12
+```
+
+## Accuracy Tips
+
+- Enroll at least two people to train the neural-network classifier.
+- Keep roughly the same number of samples per person.
+- Enroll in good lighting and avoid motion blur.
+- Re-train after adding new people.
+- Use `--clean-percentile 90` in mesh mode to remove outlier samples.
+- Use the embedding backend if InsightFace installs successfully.
+
+## Notes
+
+- `face_model.pkl` depends on the current feature layout. If `face_utils.py`
+  changes, re-enroll and re-train.
+- `venv/`, `__pycache__/`, generated visualizations, and backup CSVs are ignored
+  by git.

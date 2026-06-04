@@ -1,135 +1,229 @@
 SHPJEGIM I KODIT - face-isomorphic
 
-Ky projekt ben njohje fytyrash me kamere. Rrjedha kryesore eshte:
+Ky projekt ben njohje fytyrash nga kamera. Projekti ka tre hapa kryesore:
+
+1. enroll.py    -> mbledh te dhenat e fytyres
+2. train.py     -> trajnon modelin dhe krijon face_model.pkl
+3. recognize.py -> perdor modelin per njohje live
+
+MediaPipe perdoret per te gjetur fytyren dhe pikat e fytyres. Njohja e personit
+nuk behet vetem nga MediaPipe. Njohja dhe krahasimi behen nga modeli i trajnuar
+i projektit, i ruajtur ne face_model.pkl.
+
 
 1. enroll.py
-   Ky skript perdoret per te regjistruar nje person. Kamera hapet dhe programi
-   kerkon qe personi te shikoje ne disa poza: perpara, majtas, djathtas, lart
-   dhe poshte. Per cdo frame te mire, programi nxjerr vecorite e fytyres dhe i
-   ruan ne face_data.csv.
 
-   enroll.py kontrollon edhe cilesine e frames:
-   - nese fytyra eshte shume e vogel
-   - nese pamja eshte e turbullt
-   - nese ndricimi eshte shume i dobet ose shume i forte
-   - nese poza e kokes nuk perputhet me pozen qe kerkohet
+Ky file hap kameren dhe regjistron mostra per nje person me emer. Shembull:
 
-   Kjo ndihmon qe te mos ruhen te dhena te keqija, sepse te dhenat e keqija e
-   bejne modelin me pak te sakte.
+python enroll.py --name "Alice" --backend mesh
+
+Programi kerkon disa poza te fytyres:
+- perpara
+- majtas
+- djathtas
+- lart
+- poshte
+
+Per cdo frame, kodi kontrollon cilesine para se ta ruaje:
+- a eshte fytyra mjaftueshem e madhe ne frame
+- a eshte pamja e turbullt
+- a eshte ndricimi shume i dobet ose shume i forte
+- a eshte poza e kokes shume ekstreme
+- a perputhet poza me udhezimin qe po kerkohet
+
+Nese frame eshte i mire, ruhen vecorite numerike ne face_data.csv per mesh
+backend. Nese perdoret embedding backend dhe InsightFace eshte instaluar, ruhen
+edhe embedding-et ne face_embeddings.csv.
+
 
 2. face_utils.py
-   Ky file permban funksionet kryesore per perpunimin e fytyres me MediaPipe.
-   MediaPipe Face Mesh jep 478 pika te fytyres. Kodi i kthen keto pika ne nje
-   vektor numerik me 1534 vlera.
 
-   Vektori perbehet nga:
-   - koordinatat 3D te normalizuara te 478 pikave te fytyres
-   - raporte distancash midis pikave te rendesishme, si syte, hunda, goja dhe
-     mjekra
-   - vlera spektrale nga grafi i fytyres, te llogaritura me Laplacian
+Ky file ka funksionet kryesore per perpunimin e fytyres me MediaPipe Face Mesh.
+MediaPipe jep 478 pika te fytyres. Kodi i kthen keto pika ne nje vektor numerik
+me 1534 vlera.
 
-   face_utils.py gjithashtu llogarit yaw, pitch dhe roll, qe tregojne drejtimin
-   dhe animin e kokes. Keto perdoren per te refuzuar poza ekstreme.
+Vektori i mesh backend perbehet nga:
+
+- 1434 vlera: koordinata 3D te normalizuara per 478 pika
+- 50 vlera: raporte distancash midis syve, hundes, gojes, mjekres, faqeve etj.
+- 50 vlera: vlera spektrale nga grafi i fytyres, te llogaritura me Laplacian
+
+Ky file llogarit edhe:
+- yaw   -> kthimi i kokes majtas/djathtas
+- pitch -> animi lart/poshte
+- roll  -> rrotullimi i kokes
+
+Keto vlera perdoren per te refuzuar poza ekstreme dhe per te rritur saktesine.
+
 
 3. train.py
-   Ky skript trajnon modelin. Ai lexon face_data.csv, merr te gjitha mostrat e
-   regjistruara dhe krijon face_model.pkl.
 
-   Per backend-in mesh, trajnimi perdor kete pipeline:
-   - StandardScaler: normalizon vlerat numerike
-   - PCA: zvogelon dimensionet dhe heq zhurmen
-   - LDA: ndihmon qe personat e ndryshem te ndahen me qarte
-   - MLPClassifier: rrjet neural i vogel qe ben klasifikimin final
+Ky file trajnon modelin. Ai lexon te dhenat e regjistruara dhe krijon
+face_model.pkl.
 
-   Nese ka vetem nje person te regjistruar, modeli nuk mund te mesoje dallimin
-   midis shume fytyrave. Ne ate rast perdoret nje qender mesatare dhe nje prag
-   per te vendosur nese fytyra eshte ai person apo Unknown.
+Per mesh backend, rrjedha eshte:
 
-   train.py ka edhe opsion per pastrim te te dhenave:
-   python train.py --backend mesh --clean-percentile 90
+feature weights -> StandardScaler -> PCA -> LDA -> MLPClassifier
 
-   Kjo heq mostrat qe jane shume larg nga mesatarja e personit dhe mund te jene
-   gabime ose frame te keqija.
+Kuptimi:
+
+- feature weights: i jep me shume peshe disa pjeseve te vektorit
+- StandardScaler: normalizon vlerat
+- PCA: zvogelon dimensionet dhe largon zhurmen
+- LDA: ndihmon ndarjen midis personave te ndryshem
+- MLPClassifier: rrjet neural qe klasifikon personin
+
+Sjellje e rendesishme:
+
+- Nese ka vetem nje person te regjistruar, nuk trajnohet rrjet neural. Projekti
+  perdor nje centroid, pra nje qender mesatare, dhe vendos nese fytyra eshte ai
+  person apo Unknown.
+- Nese ka dy ose me shume persona, trajnohet rrjeti neural MLP.
+- Shtresat e fshehura te MLP jane fikse:
+
+512 -> 256 -> 128 -> 64
+
+- Shtresa e daljes rritet sipas numrit te personave. Per shembull:
+
+2 persona  -> 2 neurone daljeje
+5 persona  -> 5 neurone daljeje
+10 persona -> 10 neurone daljeje
+
+Komanda e rekomanduar per mesh backend:
+
+python train.py --backend mesh --clean-percentile 90
+
+Opsioni --clean-percentile 90 heq mostrat qe jane shume larg nga mesatarja e
+personit dhe mund te jene gabime.
+
 
 4. recognize.py
-   Ky skript hap kameren dhe ben njohjen live te fytyrave. Ai lexon
-   face_model.pkl, zbulon fytyrat ne video, nxjerr vecorite dhe perdor modelin
-   per te parashikuar emrin.
 
-   recognize.py ka disa mekanizma per ta bere njohjen me te qendrueshme:
-   - refuzon poza ekstreme dhe shfaq "?" ne vend qe te jape emer gabim
-   - perdor smoothing me disa frame, pra nuk ndryshon emrin menjehere nga nje
-     frame i vetem
-   - perdor bbox/IoU per te ndjekur fytyrat kur ka me shume se nje person ne
-     kamere
-   - shfaq Unknown kur besimi i modelit nuk eshte mjaftueshem i larte
+Ky file hap kameren dhe ben njohje live. Ai:
+
+1. lexon face_model.pkl
+2. gjen fytyrat ne frame
+3. nxjerr vecorite e fytyres
+4. perdor modelin per te parashikuar emrin
+5. shfaq emrin, Unknown ose ? ne video
+
+Mekanizma per stabilitet:
+
+- perdor smoothing me disa frame, qe emri te mos ndryshoje nga nje frame i vetem
+- perdor bbox/IoU per te ndjekur fytyrat kur ka disa persona ne kamera
+- refuzon poza ekstreme dhe shfaq "?"
+- shfaq Unknown kur besimi i modelit nuk eshte mjaftueshem i larte
+
 
 5. embedding_utils.py
-   Ky file eshte per backend-in me te forte, bazuar ne embeddings te fytyres
-   nga InsightFace. Ky backend eshte me i sakte se mesh backend, sepse perdor
-   nje model modern te trajnuar paraprakisht per njohje fytyrash.
 
-   Por InsightFace mund te jete i veshtire per t'u instaluar ne Windows sepse
-   ndonjehere kerkon Microsoft C++ Build Tools. Prandaj projekti mund te punoje
-   edhe pa te, duke perdorur backend-in mesh.
+Ky file eshte per backend-in opsional me InsightFace. InsightFace krijon nje
+embedding 512-dimensional per fytyren. Pastaj projekti e krahason embedding-un
+me centroid-et e personave te regjistruar.
 
-6. requirements.txt
-   Ky file permban librarite kryesore qe duhen per backend-in mesh:
-   - opencv-python per kameren dhe vizatimin
-   - mediapipe per zbulimin e pikave te fytyres
-   - numpy per llogaritje numerike
-   - scikit-learn per trajnimin e modelit
-   - joblib per ruajtjen e modelit
-   - networkx dhe scipy per grafet dhe spektrin Laplacian
+Ky backend zakonisht eshte me i sakte se mesh backend, por ne Windows mund te
+jete me i veshtire per t'u instaluar sepse insightface mund te kerkoje Microsoft
+C++ Build Tools.
 
-7. requirements-embedding.txt
-   Ky file permban varesite opsionale per backend-in embedding:
-   - insightface
-   - onnxruntime
+Nese InsightFace nuk instalohet, projekti mund te perdoret normalisht me mesh
+backend.
 
-   Keto nuk jane te nevojshme per te perdorur backend-in mesh.
 
-SI EKZEKUTOHET PROJEKTI
+6. neural_brain_viz.py
 
-Hapat baze:
+Ky file ben vizualizim 3D me Open3D. Ai hap nje dritare ku nyjet shfaqen si
+sfera 3D dhe lidhjet shfaqen si vija.
 
-1. Krijo dhe aktivizo virtual environment:
-   python -m venv venv
-   venv\Scripts\activate
+Komanda:
+
+python neural_brain_viz.py
+
+Vizualizimi shfaq te gjitha nyjet e arkitektures qe po paraqitet, por nuk shfaq
+te gjitha lidhjet. Arsyeja eshte se lidhjet mund te jene shume te shumta.
+Shembull: 512 neurone te lidhura me 256 neurone japin 131,072 lidhje.
+
+Prandaj:
+
+- ne multi-person MLP mode shfaqen lidhjet me peshen me te forte
+- ne one-person centroid mode shfaqen lidhje konceptuale te mostruara
+- ne embedding mode shfaqet pipeline-i i krahasimit me embedding
+
+Opsione te dobishme:
+
+python neural_brain_viz.py --edges-per-layer 150
+python neural_brain_viz.py --node-radius 0.12
+
+
+7. requirements.txt
+
+requirements.txt
+Permban te gjitha varesite e projektit:
+- opencv-python
+- mediapipe
+- numpy
+- scikit-learn
+- joblib
+- networkx
+- matplotlib
+- scipy
+- onnxruntime
+- onnx
+- insightface
+- open3d
+
+Disa nga keto, sidomos insightface dhe open3d, mund te marrin me shume kohe per
+t'u instaluar ne Windows.
+
+
+SI TA EKZEKUTOSH PROJEKTIN
+
+1. Krijo virtual environment:
+
+python -m venv venv
+venv\Scripts\activate
 
 2. Instalo varesite baze:
-   pip install -r requirements.txt
 
-3. Regjistro nje person:
-   python enroll.py --name "Emri" --backend mesh
+pip install -r requirements.txt
+
+3. Regjistro persona:
+
+python enroll.py --name "Alice" --backend mesh
+python enroll.py --name "Bob" --backend mesh
 
 4. Trajno modelin:
-   python train.py --backend mesh --clean-percentile 90
+
+python train.py --backend mesh --clean-percentile 90
 
 5. Fillo njohjen live:
-   python recognize.py
 
-Per te dalluar fytyra nga njera-tjetra, duhen te pakten dy persona te
-regjistruar. Nese regjistrohet vetem nje person, modeli di kryesisht te thote
-"ky eshte personi i njohur" ose "Unknown", por nuk mund te mesoje dallime midis
-shume fytyrave.
+python recognize.py
 
-SI MUND TE PERMIRESOHET SAKTESIA
+Shtyp Q per te mbyllur dritaren e kameres.
 
-- Regjistro me shume persona dhe me te dhena te balancuara.
-- Regjistro cdo person ne ndricim te mire.
-- Mos leviz shume gjate regjistrimit.
-- Perdore --clean-percentile 90 gjate trajnimit te mesh backend.
-- Nese mund te instalohet InsightFace, perdor backend-in embedding, sepse eshte
-  me i sakte per njohje fytyrash.
+
+KUR SHFAQET RRJETI NEURAL?
+
+Nese ke vetem nje person te regjistruar, modeli nuk eshte rrjet neural. Ai eshte
+centroid matcher:
+
+1534 vecori -> PCA -> centroid decision
+
+Nese ke dy ose me shume persona, train.py krijon MLP neural network:
+
+input -> 512 -> 256 -> 128 -> 64 -> output
+
+Output ka aq neurone sa persona jane regjistruar.
+
 
 PERMBLEDHJE
 
-Projekti eshte i ndare ne tre hapa kryesore:
-
-enroll.py   -> mbledh te dhenat e fytyres
-train.py    -> trajnon modelin
-recognize.py -> perdor modelin per njohje live
-
-face_utils.py dhe embedding_utils.py jane file ndihmese qe permbajne logjiken
-e perpunimit te fytyres dhe nxjerrjes se vecorive.
+- MediaPipe zbulon pikat e fytyres.
+- face_utils.py i kthen pikat ne vecori numerike.
+- train.py krijon face_model.pkl.
+- recognize.py perdor face_model.pkl per njohje live.
+- neural_brain_viz.py shfaq modelin/pipeline-in ne 3D.
+- Me nje person ka centroid matcher.
+- Me dy ose me shume persona ka rrjet neural MLP.
+- Embedding backend eshte opsional dhe me i forte, por me i veshtire per t'u
+  instaluar ne Windows.
