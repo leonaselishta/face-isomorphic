@@ -1,3 +1,0 @@
--r requirements.txt
-onnxruntime==1.18.1
-insightface==0.7.3

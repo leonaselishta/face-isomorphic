@@ -6,3 +6,5 @@ joblib==1.5.3
 networkx==3.4.2
 matplotlib==3.10.9
 scipy==1.13.1
+onnxruntime==1.18.1
+insightface==0.7.3
