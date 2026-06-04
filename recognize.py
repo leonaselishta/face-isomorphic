@@ -27,7 +27,7 @@ MODEL_FILE     = "face_model.pkl"
 MAX_FACES      = 6
 SMOOTH_WINDOW  = 20
 SPECTRAL_EVERY = 10   # recompute Laplacian every N frames per face
-MLP_THRESHOLD  = 0.70  # lowered slightly; LDA space is more discriminative
+MLP_THRESHOLD  = 0.70
 TRACK_IOU_THRESHOLD = 0.25
 
 # Pose limits — beyond these angles show "?" not a wrong name
@@ -40,7 +40,7 @@ ROLL_LIMIT  = 25
 def to_discriminant(bundle, feat_raw):
     """
     Apply the full preprocessing pipeline to a raw feature vector:
-      weight → scale → PCA → LDA (if multi-person)
+      weight -> scale -> PCA -> optional LDA
     Returns the projected vector ready for the classifier.
     """
     feat = feat_raw.copy()
@@ -52,7 +52,7 @@ def to_discriminant(bundle, feat_raw):
     feat_s = bundle["scaler"].transform(feat.reshape(1, -1))
     feat_p = bundle["pca"].transform(feat_s)[0]
 
-    if bundle["mode"] == "multi_person":
+    if bundle["mode"] == "multi_person" and bundle.get("use_lda", "lda" in bundle):
         feat_p = bundle["lda"].transform(feat_p.reshape(1, -1))[0]
 
     return feat_p
@@ -71,7 +71,7 @@ def predict(bundle, feat_d):
             return bundle["name"], conf
         return "Unknown", 0.0
 
-    # multi-person: MLP on LDA-projected space
+    # multi-person: MLP on PCA or LDA-projected space
     proba = bundle["model"].predict_proba(feat_d.reshape(1, -1))[0]
     idx   = int(np.argmax(proba))
     conf  = float(proba[idx])
@@ -349,7 +349,12 @@ def main():
             f"current code is v{SCHEMA_VER}. Re-enroll and retrain."
         )
 
-    mode_str = "Centroid" if bundle["mode"] == "one_person" else "MLP + LDA"
+    if bundle["mode"] == "one_person":
+        mode_str = "Centroid"
+    elif bundle.get("use_lda", "lda" in bundle):
+        mode_str = "PCA + LDA + MLP"
+    else:
+        mode_str = "PCA + MLP"
     log.info(f"Mode: {mode_str}")
     log.info(f"Enrolled: {bundle['people']}\n")
 
@@ -472,8 +477,10 @@ def main():
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, (0, 255, 0), 2)
 
-            mode_label = "PCA+LDA+MLP" if bundle["mode"] == "multi_person" \
-                         else "Centroid"
+            if bundle["mode"] == "multi_person":
+                mode_label = "PCA+LDA+MLP" if bundle.get("use_lda", "lda" in bundle) else "PCA+MLP"
+            else:
+                mode_label = "Centroid"
             cv2.putText(frame, f"Pose-normalised | {mode_label} | Q=quit",
                         (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.4, (100, 100, 100), 1)

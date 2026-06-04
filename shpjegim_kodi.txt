@@ -61,17 +61,24 @@ Keto vlera perdoren per te refuzuar poza ekstreme dhe per te rritur saktesine.
 Ky file trajnon modelin. Ai lexon te dhenat e regjistruara dhe krijon
 face_model.pkl.
 
-Per mesh backend, rrjedha eshte:
+Per mesh backend, rrjedha e re e parazgjedhur eshte:
 
-feature weights -> StandardScaler -> PCA -> LDA -> MLPClassifier
+feature weights -> StandardScaler -> PCA -> MLPClassifier
 
 Kuptimi:
 
 - feature weights: i jep me shume peshe disa pjeseve te vektorit
 - StandardScaler: normalizon vlerat
 - PCA: zvogelon dimensionet dhe largon zhurmen
-- LDA: ndihmon ndarjen midis personave te ndryshem
 - MLPClassifier: rrjet neural qe klasifikon personin
+
+LDA eshte opsionale. Versioni i vjeter me LDA mund te perdoret me:
+
+python train.py --backend mesh --classifier lda-mlp --clean-percentile 90
+
+Arsyeja pse LDA nuk eshte me parazgjedhje eshte se LDA mund te kompresoje shume
+fort te dhenat. LDA ka maksimum number_of_people - 1 dimensione. Pra me 2
+persona jep vetem 1 dimension, qe mund te humbase informacion te rendesishem.
 
 Sjellje e rendesishme:
 
@@ -153,6 +160,11 @@ Opsione te dobishme:
 python neural_brain_viz.py --edges-per-layer 150
 python neural_brain_viz.py --node-radius 0.12
 
+Per te pare formen e plote te rrjetit neural pa regjistruar person tjeter dhe
+pa ndryshuar face_model.pkl:
+
+python neural_brain_viz.py --demo-mlp --demo-people 2
+
 
 7. requirements.txt
 
@@ -209,9 +221,14 @@ centroid matcher:
 
 1534 vecori -> PCA -> centroid decision
 
-Nese ke dy ose me shume persona, train.py krijon MLP neural network:
+Nese ke dy ose me shume persona, train.py krijon MLP neural network. Rrjedha e
+parazgjedhur eshte:
 
-input -> 512 -> 256 -> 128 -> 64 -> output
+1534 vecori -> PCA -> 512 -> 256 -> 128 -> 64 -> output
+
+Versioni opsional me LDA eshte:
+
+1534 vecori -> PCA -> LDA -> 512 -> 256 -> 128 -> 64 -> output
 
 Output ka aq neurone sa persona jane regjistruar.
 

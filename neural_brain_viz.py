@@ -45,12 +45,13 @@ def build_nodes(layers, z_spacing=4.0):
     return np.asarray(nodes, dtype=np.float64)
 
 
-def build_strongest_edges(weights, layers, edges_per_layer):
+def build_strongest_edges(weights, layers, edges_per_layer, start_layer=0):
     offsets = layer_offsets(layers)
     line_chunks = []
     color_chunks = []
 
     for li, weight_matrix in enumerate(weights):
+        layer_idx = start_layer + li
         # scikit-learn MLP stores weights as (input_neurons, output_neurons).
         flat_abs = np.abs(weight_matrix).ravel()
         if flat_abs.size == 0:
@@ -65,8 +66,8 @@ def build_strongest_edges(weights, layers, edges_per_layer):
 
         src, dst = np.unravel_index(pick, weight_matrix.shape)
         lines = np.column_stack([
-            offsets[li] + src,
-            offsets[li + 1] + dst,
+            offsets[layer_idx] + src,
+            offsets[layer_idx + 1] + dst,
         ])
         line_chunks.append(lines)
 
@@ -103,6 +104,28 @@ def pseudo_edges(layers, edges_per_layer):
     return np.vstack(chunks).astype(np.int32), np.vstack(colors)
 
 
+def pseudo_edges_for_range(layers, edges_per_layer, start_layer, end_layer):
+    offsets = layer_offsets(layers)
+    rng = np.random.default_rng(42)
+    chunks = []
+    colors = []
+    for li in range(start_layer, end_layer):
+        left, right = layers[li], layers[li + 1]
+        k = min(edges_per_layer, left * right)
+        src = rng.integers(0, left, size=k)
+        dst = rng.integers(0, right, size=k)
+        chunks.append(np.column_stack([offsets[li] + src, offsets[li + 1] + dst]))
+        color = np.array([[0.35, 0.62, 0.90]], dtype=np.float64)
+        colors.append(np.repeat(color, k, axis=0) * 0.35)
+
+    if not chunks:
+        return (
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros((0, 3), dtype=np.float64),
+        )
+    return np.vstack(chunks).astype(np.int32), np.vstack(colors)
+
+
 def architecture(bundle):
     if bundle.get("backend") == "embedding":
         people = bundle.get("people", [])
@@ -115,13 +138,19 @@ def architecture(bundle):
 
     if bundle.get("mode") == "multi_person":
         model = bundle["model"]
-        layers = [int(model.coefs_[0].shape[0])]
+        feat_dim = int(bundle.get("feat_dim", 1534))
+        pca_dim = int(getattr(bundle.get("pca"), "n_components_", model.coefs_[0].shape[0]))
+        layers = [feat_dim, pca_dim]
+        if bundle.get("use_lda", "lda" in bundle):
+            layers.append(int(model.coefs_[0].shape[0]))
         layers.extend(int(c.shape[1]) for c in model.coefs_)
+        path = "PCA + LDA + MLP" if bundle.get("use_lda", "lda" in bundle) else "PCA + MLP"
         return {
             "title": "Mesh MLP neural network",
             "layers": layers,
             "weights": model.coefs_,
-            "note": "Showing strongest learned MLP connections.",
+            "weight_start_layer": 2 if bundle.get("use_lda", "lda" in bundle) else 1,
+            "note": f"{path}. Showing strongest learned MLP connections.",
         }
 
     feat_dim = int(bundle.get("feat_dim", 1534))
@@ -133,6 +162,20 @@ def architecture(bundle):
         "note": (
             "No neural network exists for one-person mode. Showing pipeline "
             "nodes with sampled conceptual links."
+        ),
+    }
+
+
+def demo_architecture(num_people=2):
+    layers = [1534, 200, 512, 256, 128, 64, int(num_people)]
+    return {
+        "title": "Demo multi-person mesh neural network",
+        "layers": layers,
+        "weights": None,
+        "note": (
+            "Demo only: this shows the new default PCA + MLP architecture without "
+            "changing face_model.pkl. Links are sampled conceptual links, not "
+            "trained weights."
         ),
     }
 
@@ -175,14 +218,21 @@ def main():
     parser.add_argument("--model", default=MODEL_FILE)
     parser.add_argument("--edges-per-layer", type=int, default=EDGES_PER_LAYER)
     parser.add_argument("--node-radius", type=float, default=NODE_RADIUS)
+    parser.add_argument("--demo-mlp", action="store_true",
+                        help="Show a demo multi-person MLP without loading a model")
+    parser.add_argument("--demo-people", type=int, default=2,
+                        help="Number of output people/classes for --demo-mlp")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.model):
+    if not args.demo_mlp and not os.path.isfile(args.model):
         raise SystemExit(f"{args.model} not found. Run train.py first.")
 
     o3d = require_open3d()
-    bundle = joblib.load(args.model)
-    info = architecture(bundle)
+    if args.demo_mlp:
+        info = demo_architecture(args.demo_people)
+    else:
+        bundle = joblib.load(args.model)
+        info = architecture(bundle)
     layers = info["layers"]
     nodes = build_nodes(layers)
     node_colors = node_colors_for_layers(layers)
@@ -190,8 +240,14 @@ def main():
     if info["weights"] is None:
         lines, line_colors = pseudo_edges(layers, args.edges_per_layer)
     else:
-        lines, line_colors = build_strongest_edges(
-            info["weights"], layers, args.edges_per_layer)
+        start_layer = int(info.get("weight_start_layer", 0))
+        pre_lines, pre_colors = pseudo_edges_for_range(
+            layers, args.edges_per_layer, 0, start_layer)
+        mlp_lines, mlp_colors = build_strongest_edges(
+            info["weights"], layers, args.edges_per_layer,
+            start_layer=start_layer)
+        lines = np.vstack([pre_lines, mlp_lines])
+        line_colors = np.vstack([pre_colors, mlp_colors])
 
     line_set = o3d.geometry.LineSet()
     line_set.points = o3d.utility.Vector3dVector(nodes)

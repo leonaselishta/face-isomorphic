@@ -90,31 +90,12 @@ def train_one_person(X_pca, name):
             "threshold": thresh, "name": name}
 
 
-# ── multi-person mode ─────────────────────────────────────────────────────────
-def train_multi(X_pca, labels, le, n_classes):
-    """
-    Apply LDA on top of PCA, then train an MLP.
-    LDA maximises between-class scatter relative to within-class scatter —
-    ideal for distinguishing multiple faces simultaneously.
-    """
-    y_enc = le.fit_transform(labels)
-
-    # LDA: reduces to at most (n_classes - 1) dimensions
-    n_lda = min(n_classes - 1, X_pca.shape[1])
-    lda   = LDA(n_components=n_lda, solver="svd", store_covariance=True)
-    X_lda = lda.fit_transform(X_pca, y_enc)
-    log.info(f"LDA: {X_pca.shape[1]}D → {X_lda.shape[1]}D  "
-             f"(maximising between-class separation for {n_classes} people)")
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X_lda, y_enc, test_size=0.2, random_state=42, stratify=y_enc)
-
-    # MLP — wider first layer to handle the richer feature space
-    model = MLPClassifier(
+def make_mlp():
+    return MLPClassifier(
         hidden_layer_sizes=(512, 256, 128, 64),
         activation="relu",
         solver="adam",
-        alpha=1e-3,           # L2 regularisation
+        alpha=1e-3,
         max_iter=2000,
         random_state=42,
         early_stopping=True,
@@ -122,23 +103,61 @@ def train_multi(X_pca, labels, le, n_classes):
         n_iter_no_change=30,
         verbose=False,
     )
+
+
+def calibrate_unknown_rejection(model, X, floor=0.65):
+    proba = model.predict_proba(X)
+    best = proba.max(axis=1)
+    ordered = np.sort(proba, axis=1)
+    margins = ordered[:, -1] - ordered[:, -2] if proba.shape[1] > 1 else best
+    conf_threshold = max(floor, float(np.percentile(best, 10) * 0.95))
+    margin_threshold = max(0.05, float(np.percentile(margins, 10) * 0.80))
+    log.info(
+        "Unknown rejection: confidence >= %.2f and margin >= %.2f",
+        conf_threshold, margin_threshold)
+    return conf_threshold, margin_threshold
+
+
+# ── multi-person mode ─────────────────────────────────────────────────────────
+def train_multi(X_pca, labels, le, n_classes, classifier):
+    """
+    Train the multi-person mesh classifier.
+
+    classifier="mlp" keeps the richer PCA representation and sends it directly
+    to the MLP. classifier="lda-mlp" keeps the older PCA -> LDA -> MLP path.
+    """
+    y_enc = le.fit_transform(labels)
+
+    lda = None
+    if classifier == "lda-mlp":
+        # LDA is limited to (n_classes - 1) dimensions. This can be useful with
+        # many classes, but it is very aggressive for two-person datasets.
+        n_lda = min(n_classes - 1, X_pca.shape[1])
+        lda = LDA(n_components=n_lda, solver="svd", store_covariance=True)
+        X_model = lda.fit_transform(X_pca, y_enc)
+        log.info(f"LDA: {X_pca.shape[1]}D -> {X_model.shape[1]}D  "
+                 f"(class-separating compression for {n_classes} people)")
+    else:
+        X_model = X_pca
+        log.info(
+            "Classifier input: PCA features kept at %dD (no LDA compression)",
+            X_model.shape[1])
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_model, y_enc, test_size=0.2, random_state=42, stratify=y_enc)
+
+    model = make_mlp()
     model.fit(X_tr, y_tr)
 
     y_pred = model.predict(X_te)
     log.info("\n── Evaluation ──────────────────────────────────────────────")
     log.info("\n" + classification_report(y_te, y_pred, target_names=le.classes_))
 
-    # cross-validation on full LDA space for a more robust accuracy estimate
-    if len(X_lda) >= 10:
+    # cross-validation for a more robust accuracy estimate
+    if len(X_model) >= 10:
         cv_scores = cross_val_score(
-            MLPClassifier(
-                hidden_layer_sizes=(512, 256, 128, 64),
-                activation="relu", solver="adam", alpha=1e-3,
-                max_iter=2000, random_state=42,
-                early_stopping=True, validation_fraction=0.15,
-                n_iter_no_change=30,
-            ),
-            X_lda, y_enc,
+            make_mlp(),
+            X_model, y_enc,
             cv=StratifiedKFold(n_splits=min(5, len(np.unique(y_enc))),
                                shuffle=True, random_state=42),
             scoring="accuracy",
@@ -146,24 +165,20 @@ def train_multi(X_pca, labels, le, n_classes):
         log.info(f"Cross-val accuracy: {cv_scores.mean()*100:.1f}% "
                  f"± {cv_scores.std()*100:.1f}%")
 
-    proba = model.predict_proba(X_lda)
-    best = proba.max(axis=1)
-    ordered = np.sort(proba, axis=1)
-    margins = ordered[:, -1] - ordered[:, -2] if proba.shape[1] > 1 else best
-    conf_threshold = max(0.65, float(np.percentile(best, 10) * 0.95))
-    margin_threshold = max(0.05, float(np.percentile(margins, 10) * 0.80))
-    log.info(
-        "Unknown rejection: confidence >= %.2f and margin >= %.2f",
-        conf_threshold, margin_threshold)
+    conf_threshold, margin_threshold = calibrate_unknown_rejection(model, X_model)
 
-    return {
+    bundle = {
         "mode": "multi_person",
         "model": model,
         "encoder": le,
-        "lda": lda,
+        "classifier": classifier,
+        "use_lda": lda is not None,
         "conf_threshold": conf_threshold,
         "margin_threshold": margin_threshold,
     }
+    if lda is not None:
+        bundle["lda"] = lda
+    return bundle
 
 
 # ── embedding mode ────────────────────────────────────────────────────────────
@@ -250,6 +265,9 @@ def main():
     parser.add_argument("--embedding-data", default=EMBEDDING_DATA_FILE)
     parser.add_argument("--clean-percentile", type=float,
                         help="Drop per-person mesh outliers above this percentile")
+    parser.add_argument("--classifier", choices=("mlp", "lda-mlp"),
+                        default="mlp",
+                        help="Mesh multi-person classifier (default: mlp keeps PCA dimensions)")
     args = parser.parse_args()
 
     if args.backend == "embedding":
@@ -325,7 +343,7 @@ def main():
         bundle = train_one_person(X_pca, unique_people[0])
     else:
         le     = LabelEncoder()
-        bundle = train_multi(X_pca, labels, le, n_classes)
+        bundle = train_multi(X_pca, labels, le, n_classes, args.classifier)
 
     bundle.update({
         "backend":         "mesh",

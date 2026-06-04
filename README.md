@@ -3,7 +3,7 @@
 Face recognition from a webcam. The project can run in two modes:
 
 - **Mesh backend:** uses MediaPipe Face Mesh landmarks, handcrafted geometry
-  features, PCA/LDA, and a scikit-learn classifier. This is the default and the
+  features, PCA, and a scikit-learn classifier. This is the default and the
   easiest mode to run on Windows.
 - **Embedding backend:** uses InsightFace embeddings for stronger recognition.
   This is optional because `insightface` can require extra build tools.
@@ -24,7 +24,7 @@ by the saved project model, `face_model.pkl`.
 | File | Purpose |
 |---|---|
 | `enroll.py` | Opens the webcam and records face samples for a named person. It checks blur, lighting, face size, and pose before saving samples. |
-| `train.py` | Trains `face_model.pkl` from the saved samples. Mesh mode uses StandardScaler, PCA, LDA, and MLP when there are 2+ people. |
+| `train.py` | Trains `face_model.pkl` from the saved samples. Mesh mode uses StandardScaler, PCA, and MLP when there are 2+ people. LDA is optional. |
 | `recognize.py` | Opens the webcam, detects faces, extracts features, and predicts a name or `Unknown`. |
 | `face_utils.py` | Shared MediaPipe mesh feature extraction, pose estimation, quality checks, and graph features. |
 | `embedding_utils.py` | Optional InsightFace embedding support. |
@@ -103,12 +103,26 @@ Training then applies:
 feature weights -> StandardScaler -> PCA -> LDA -> MLPClassifier
 ```
 
+The default is now:
+
+```text
+feature weights -> StandardScaler -> PCA -> MLPClassifier
+```
+
+The older LDA-compressed version is still available:
+
+```powershell
+python train.py --backend mesh --classifier lda-mlp --clean-percentile 90
+```
+
 Important behavior:
 
 - With **one enrolled person**, the project does not train a neural network. It
   uses a centroid threshold: known person vs `Unknown`.
 - With **two or more enrolled people**, `train.py` trains an MLP neural network.
-  The hidden layers are fixed at `512 -> 256 -> 128 -> 64`.
+  By default the MLP receives the richer PCA representation directly, avoiding
+  LDA's `number_of_people - 1` compression limit. The hidden layers are fixed at
+  `512 -> 256 -> 128 -> 64`.
 - The output layer grows with the number of enrolled people.
 
 ## 3D Model Visualization
@@ -132,6 +146,13 @@ Useful options:
 ```powershell
 python neural_brain_viz.py --edges-per-layer 150
 python neural_brain_viz.py --node-radius 0.12
+```
+
+To preview the full multi-person neural network without enrolling another
+person or changing `face_model.pkl`:
+
+```powershell
+python neural_brain_viz.py --demo-mlp --demo-people 2
 ```
 
 ## Accuracy Tips
