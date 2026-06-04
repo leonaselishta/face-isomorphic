@@ -9,8 +9,7 @@ import numpy as np
 import networkx as nx
 import mediapipe as mp
 
-logger = mp.solutions.face_mesh  # silence mediapipe; use our own logger
-log    = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 mp_face_mesh     = mp.solutions.face_mesh
 TESS_CONNECTIONS = frozenset(mp_face_mesh.FACEMESH_TESSELATION)
