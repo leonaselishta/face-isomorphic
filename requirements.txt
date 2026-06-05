@@ -8,5 +8,5 @@ matplotlib==3.9.4
 scipy==1.13.1
 onnxruntime==1.18.1
 onnx==1.18.0
-insightface==0.7.3 
+insightface==0.7.3
 open3d==0.18.0
