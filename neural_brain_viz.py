@@ -198,42 +198,69 @@ def build_lineset(o3d, nodes, lines, line_colors):
 
 # ── architecture helpers ──────────────────────────────────────────────────────
 def architecture(bundle):
-    if bundle.get("backend") == "embedding":
-        people = bundle.get("people", [])
-        return {
-            "title": "Embedding centroid recognizer",
-            "layers": [478, int(bundle.get("embedding_dim", 512)), len(people)],
-            "weights": None,
-            "note": "No MLP weights: showing embedding comparison pipeline.",
-        }
     if bundle.get("mode") == "multi_person":
-        model    = bundle["model"]
+        model = bundle["model"]
         feat_dim = int(bundle.get("feat_dim", 1534))
-        pca_dim  = int(getattr(bundle.get("pca"), "n_components_",
-                               model.coefs_[0].shape[0]))
-        layers   = [feat_dim, pca_dim]
 
-        use_lda = bundle.get("use_lda", False)
+        # robustly get PCA output dimension if available
+        pca_obj = bundle.get("pca")
+        if pca_obj is not None:
+            if hasattr(pca_obj, "n_components_"):
+                pca_dim = int(pca_obj.n_components_)
+            elif hasattr(pca_obj, "n_components"):
+                pca_dim = int(pca_obj.n_components)
+            else:
+                pca_dim = feat_dim
+        else:
+            pca_dim = feat_dim
+
+        # If the model is an MLPClassifier it exposes `coefs_` — use those
+        mlp_coefs = getattr(model, "coefs_", None)
         n_classes = len(bundle["encoder"].classes_)
+
+        if mlp_coefs is not None:
+            layers = [feat_dim, pca_dim]
+            use_lda = bundle.get("use_lda", False)
+            if use_lda and "lda" in bundle:
+                lda_out = int(bundle["lda"].n_components)
+                layers.append(lda_out)
+                weight_start = len(layers) - 1
+            else:
+                weight_start = len(layers) - 1
+
+            # MLP hidden layers from coefs (skip last coef's output — use encoder count)
+            for c in mlp_coefs[:-1]:
+                layers.append(int(c.shape[1]))
+            layers.append(n_classes)   # true output count, not coefs[-1].shape[1]
+
+            path = "PCA + LDA + MLP" if use_lda else "PCA + MLP"
+            return {
+                "title": f"Mesh MLP — {n_classes} people  ({', '.join(bundle['encoder'].classes_)})",
+                "layers": layers,
+                "weights": mlp_coefs,
+                "weight_start_layer": weight_start,
+                "note": f"{path}. Showing strongest learned MLP connections.",
+            }
+
+        # Non-MLP model (for example a CalibratedClassifierCV wrapping an SVM).
+        # No `coefs_` to visualize; show PCA(+optional LDA) → classifier pipeline.
+        use_lda = bundle.get("use_lda", False)
         if use_lda and "lda" in bundle:
             lda_out = int(bundle["lda"].n_components)
-            layers.append(lda_out)
-            weight_start = len(layers) - 1
+            layers = [feat_dim, pca_dim, lda_out, n_classes]
+            weight_start = 2
+            path = "PCA + LDA + classifier"
         else:
-            weight_start = len(layers) - 1
+            layers = [feat_dim, pca_dim, n_classes]
+            weight_start = 1
+            path = "PCA + classifier"
 
-        # MLP hidden layers from coefs (skip last coef's output — use encoder count)
-        for c in model.coefs_[:-1]:
-            layers.append(int(c.shape[1]))
-        layers.append(n_classes)   # true output count, not coefs[-1].shape[1]
-
-        path = "PCA + LDA + MLP" if use_lda else "PCA + MLP"
         return {
-            "title": f"Mesh MLP — {n_classes} people  ({', '.join(bundle['encoder'].classes_)})",
+            "title": f"Mesh classifier — {n_classes} people  ({', '.join(bundle['encoder'].classes_)})",
             "layers": layers,
-            "weights": model.coefs_,
+            "weights": None,
             "weight_start_layer": weight_start,
-            "note": f"{path}. Showing strongest learned MLP connections.",
+            "note": f"{path}. No MLP weights available; showing conceptual links.",
         }
     feat_dim = int(bundle.get("feat_dim", 1534))
     pca_dim  = int(bundle["centroid"].shape[0])

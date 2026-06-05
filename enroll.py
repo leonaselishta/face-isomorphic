@@ -1,4 +1,4 @@
-"""Guided enrollment for mesh features and optional InsightFace embeddings."""
+"""Guided enrollment for mesh features."""
 
 import cv2
 import mediapipe as mp
@@ -12,9 +12,7 @@ from face_utils import (
     extract_features, face_quality, landmark_bbox, pose_matches_target,
     MeshLaplacianWorker, N_COORDS, FEAT_DIM, SCHEMA_VER,
 )
-from embedding_utils import (
-    EMBEDDING_DATA_FILE, EMBEDDING_DIM, FaceEmbedder, largest_face,
-)
+# embedding backend removed — mesh-only enrollment
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -112,9 +110,6 @@ def main():
     parser.add_argument("--per-pose", type=int, default=60)
     parser.add_argument("--augment",  type=int, default=2,
                         help="Jittered copies per real sample (0 = off)")
-    parser.add_argument("--backend", choices=("mesh", "embedding", "both"),
-                        default="both",
-                        help="Which enrollment data to save")
     args = parser.parse_args()
 
     if args.name:
@@ -127,19 +122,7 @@ def main():
     per_pose = args.per_pose
     n_aug    = max(0, args.augment)
     mesh_rows = []
-    embedding_rows = []
     rng      = np.random.default_rng(seed=None)
-    embedder = None
-
-    if args.backend in ("embedding", "both"):
-        try:
-            embedder = FaceEmbedder()
-            log.info("Embedding backend ready: InsightFace")
-        except RuntimeError as exc:
-            if args.backend == "embedding":
-                log.error(str(exc))
-                return
-            log.warning("%s; continuing with mesh enrollment only.", exc)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -214,17 +197,9 @@ def main():
                                 quality_reason = "match requested pose"
 
                             if capturing and quality_ok:
-                                if args.backend in ("mesh", "both"):
-                                    mesh_rows.append([name] + feat.tolist())
-                                    for aug_feat in augment_feature(feat, rng, n_aug):
-                                        mesh_rows.append([name] + aug_feat.tolist())
-
-                                if embedder is not None:
-                                    emb_face = largest_face(embedder.extract(frame))
-                                    if emb_face is not None:
-                                        embedding_rows.append(
-                                            [name] + emb_face["embedding"].tolist())
-
+                                mesh_rows.append([name] + feat.tolist())
+                                for aug_feat in augment_feature(feat, rng, n_aug):
+                                    mesh_rows.append([name] + aug_feat.tolist())
                                 collected += 1
 
                             x1, y1, x2, y2 = landmark_bbox(lms, w, h)
@@ -255,7 +230,6 @@ def main():
                         break
                     elif key == ord("q"):
                         _save_mesh(mesh_rows, name, n_aug)
-                        _save_embeddings(embedding_rows, name)
                         return
 
                 # auto-advance message
@@ -267,7 +241,6 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         _save_mesh(mesh_rows, name, n_aug)
-        _save_embeddings(embedding_rows, name)
 
 
 def _save_mesh(rows, name, n_aug):
@@ -303,30 +276,7 @@ def _save_mesh(rows, name, n_aug):
             real_samples, MIN_REAL_SAMPLES_PER_PERSON)
 
 
-def _save_embeddings(rows, name):
-    if not rows:
-        log.warning("No embedding data collected.")
-        return
-
-    n_features = len(rows[0]) - 1
-    file_exists = os.path.isfile(EMBEDDING_DATA_FILE)
-    if n_features != EMBEDDING_DIM:
-        log.error(
-            f"Embedding dimension mismatch: got {n_features}, "
-            f"expected {EMBEDDING_DIM}."
-        )
-        return
-
-    with open(EMBEDDING_DATA_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            header = ["label_embedding_v1"] + [f"e{i}" for i in range(n_features)]
-            writer.writerow(header)
-        writer.writerows(rows)
-
-    log.info(
-        f"Saved {len(rows)} embedding rows for '{name}' → {EMBEDDING_DATA_FILE}"
-    )
+    
 
 
 if __name__ == "__main__":

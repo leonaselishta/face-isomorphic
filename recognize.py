@@ -1,4 +1,4 @@
-"""Live face recognition using either embeddings or the mesh classifier."""
+"""Live face recognition using the mesh classifier."""
 
 import cv2
 import mediapipe as mp
@@ -12,7 +12,7 @@ from face_utils import (
     extract_features, landmark_bbox, is_pose_extreme, MeshLaplacianWorker,
     N_SPECTRAL, N_RATIOS, N_COORDS, SCHEMA_VER,
 )
-from embedding_utils import FaceEmbedder, l2_normalize
+# embedding backend removed; mesh-only recognition
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -78,20 +78,7 @@ def predict(bundle, feat_d):
     return "Unknown", conf
 
 
-def predict_embedding(bundle, embedding):
-    emb = l2_normalize(embedding)
-    centroids = bundle["centroids"]
-    scores = centroids @ emb
-    idx = int(np.argmax(scores))
-    best = float(scores[idx])
-    ordered = np.sort(scores)
-    margin = float(ordered[-1] - ordered[-2]) if len(ordered) > 1 else best
-    name = bundle["centroid_names"][idx]
-    threshold = float(bundle["thresholds"].get(name, 0.45))
-    margin_threshold = float(bundle.get("margin_threshold", 0.08))
-    if best >= threshold and margin >= margin_threshold:
-        return name, best
-    return "Unknown", best
+
 
 
 # ── per-face state ────────────────────────────────────────────────────────────
@@ -210,75 +197,6 @@ def match_smoother_bbox(smoothers, bbox, cx, cy, frame_w, frame_h):
     return match_smoother(smoothers, cx, cy, frame_w, frame_h)
 
 
-def run_embedding_recognition(bundle):
-    try:
-        embedder = FaceEmbedder()
-    except RuntimeError as exc:
-        log.error(str(exc))
-        return
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        log.error("Cannot open camera. Check that no other app is using it.")
-        return
-
-    log.info("Mode: InsightFace embeddings + cosine thresholds")
-    log.info(f"Enrolled: {bundle['people']}\n")
-    smoothers = []
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        h, w = frame.shape[:2]
-        faces = embedder.extract(frame)
-        active_boxes = []
-
-        for face in faces:
-            x1, y1, x2, y2 = [int(v) for v in face["bbox"]]
-            bbox = (x1, y1, x2, y2)
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            active_boxes.append(bbox)
-
-            smoother = match_smoother_bbox(smoothers, bbox, cx, cy, w, h)
-            if smoother is None:
-                smoother = FaceSmoother(use_laplacian=False)
-                smoothers.append(smoother)
-            smoother.center = (cx, cy)
-            smoother.bbox = bbox
-
-            name, conf = predict_embedding(bundle, face["embedding"])
-            smoother.update(name, conf)
-
-            label = smoother.label
-            conf_val = smoother.confidence
-            color = (0, 220, 0) if label not in ("Unknown", "...") else (0, 0, 220)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"{label}  {conf_val * 100:.0f}%",
-                        (x1, max(24, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
-
-        smoothers = [
-            s for s in smoothers
-            if s.bbox is not None and any(
-                bbox_iou(s.bbox, box) >= TRACK_IOU_THRESHOLD for box in active_boxes
-            )
-        ]
-
-        cv2.putText(frame, f"Faces: {len(faces)} | embeddings | Q=quit",
-                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (100, 100, 100), 1)
-        cv2.imshow("Face Recognition - Embeddings", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    for s in smoothers:
-        s.stop()
-    cap.release()
-    cv2.destroyAllWindows()
-
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -288,9 +206,7 @@ def main():
 
     bundle = joblib.load(MODEL_FILE)
 
-    if bundle.get("backend") == "embedding":
-        run_embedding_recognition(bundle)
-        return
+    # embedding backend removed — proceed with mesh recognition
 
     # schema version check
     model_ver = bundle.get("schema_ver", 1)

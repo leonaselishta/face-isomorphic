@@ -1,4 +1,4 @@
-"""Train either the mesh classifier or the recommended embedding matcher."""
+"""Train the mesh classifier from enrolled mesh features."""
 
 import argparse
 import logging
@@ -18,9 +18,7 @@ from sklearn.pipeline         import Pipeline
 from sklearn.calibration      import CalibratedClassifierCV
 
 from face_utils import N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER
-from embedding_utils import (
-    EMBEDDING_DATA_FILE, EMBEDDING_DIM, l2_normalize,
-)
+# embedding backend removed; mesh-only training
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -34,8 +32,6 @@ SPECTRAL_WEIGHT  = 3.0
 RATIO_WEIGHT     = 2.0
 THRESHOLD_PCTILE = 95
 THRESHOLD_FACTOR = 1.2
-EMBEDDING_THRESHOLD_FLOOR = 0.38
-EMBEDDING_MARGIN = 0.08
 CLEAN_PCA_COMPONENTS = 50
 
 
@@ -206,77 +202,7 @@ def train_multi(X_pca, labels, le, n_classes, classifier):
 
 
 # ── embedding mode ────────────────────────────────────────────────────────────
-def train_embedding(data_file, model_file):
-    if not os.path.isfile(data_file):
-        log.error(f"{data_file} not found. Run enroll.py --backend embedding first.")
-        return
 
-    with open(data_file, newline="") as f:
-        reader = csv.reader(f)
-        next(reader)
-        rows = list(reader)
-
-    if not rows:
-        log.error("Embedding data file is empty.")
-        return
-
-    labels = np.array([r[0] for r in rows])
-    X = l2_normalize(np.array([r[1:] for r in rows], dtype=np.float32))
-    if X.shape[1] != EMBEDDING_DIM:
-        log.error(
-            f"Embedding dimension mismatch: CSV has {X.shape[1]}, "
-            f"expected {EMBEDDING_DIM}."
-        )
-        return
-
-    people = list(dict.fromkeys(labels.tolist()))
-    centroids = {}
-    thresholds = {}
-    log.info(f"Loaded {len(X)} embeddings, {len(people)} person(s): {people}")
-
-    for person in people:
-        samples = X[labels == person]
-        centroid = l2_normalize(samples.mean(axis=0))
-        sims = samples @ centroid
-        threshold = max(
-            EMBEDDING_THRESHOLD_FLOOR,
-            float(np.percentile(sims, 5) - 0.03),
-        )
-        centroids[person] = centroid.astype(np.float32)
-        thresholds[person] = threshold
-        log.info(
-            "  %s: %d samples | median cosine %.3f | threshold %.3f",
-            person, len(samples), float(np.median(sims)), threshold)
-
-    centroid_names = list(centroids)
-    centroid_matrix = np.stack([centroids[p] for p in centroid_names])
-    train_scores = X @ centroid_matrix.T
-    pred_idx = np.argmax(train_scores, axis=1)
-    pred = np.array([centroid_names[i] for i in pred_idx])
-    train_acc = float(np.mean(pred == labels))
-    log.info("Centroid training accuracy: %.1f%%", train_acc * 100)
-
-    if len(people) > 1:
-        same = train_scores[np.arange(len(X)), pred_idx]
-        sorted_scores = np.sort(train_scores, axis=1)
-        margins = sorted_scores[:, -1] - sorted_scores[:, -2]
-        log.info(
-            "Median best cosine %.3f | median identity margin %.3f",
-            float(np.median(same)), float(np.median(margins)))
-
-    bundle = {
-        "backend": "embedding",
-        "mode": "embedding_centroid",
-        "people": people,
-        "centroid_names": centroid_names,
-        "centroids": centroid_matrix.astype(np.float32),
-        "thresholds": thresholds,
-        "margin_threshold": EMBEDDING_MARGIN,
-        "embedding_dim": EMBEDDING_DIM,
-        "schema_ver": "embedding_v1",
-    }
-    joblib.dump(bundle, model_file)
-    log.info(f"\nEmbedding model saved → {model_file}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -284,9 +210,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data",  default=DATA_FILE)
     parser.add_argument("--model", default=MODEL_FILE)
-    parser.add_argument("--backend", choices=("mesh", "embedding"),
-                        default="mesh")
-    parser.add_argument("--embedding-data", default=EMBEDDING_DATA_FILE)
+    # mesh-only backend
     parser.add_argument("--clean-percentile", type=float,
                         help="Drop per-person mesh outliers above this percentile")
     parser.add_argument("--classifier", choices=("svm", "mlp", "lda-mlp"),
@@ -294,9 +218,7 @@ def main():
                         help="Classifier: svm (default, most accurate), lda-mlp, mlp")
     args = parser.parse_args()
 
-    if args.backend == "embedding":
-        train_embedding(args.embedding_data, args.model)
-        return
+    # embedding backend removed; always train mesh model
 
     if not os.path.isfile(args.data):
         log.error(f"{args.data} not found. Run enroll.py first.")

@@ -5,8 +5,8 @@ Face recognition from a webcam. The project can run in two modes:
 - **Mesh backend:** uses MediaPipe Face Mesh landmarks, handcrafted geometry
   features, PCA, and a scikit-learn classifier. This is the default and the
   easiest mode to run on Windows.
-- **Embedding backend:** uses InsightFace embeddings for stronger recognition.
-  This is optional because `insightface` can require extra build tools.
+- **Embedding backend:** removed. The project now uses the mesh backend
+  (MediaPipe landmarks + MLP) by default.
 
 ## Project Flow
 
@@ -27,7 +27,6 @@ by the saved project model, `face_model.pkl`.
 | `train.py` | Trains `face_model.pkl` from the saved samples. Mesh mode uses StandardScaler, PCA, and MLP when there are 2+ people. LDA is optional. |
 | `recognize.py` | Opens the webcam, detects faces, extracts features, and predicts a name or `Unknown`. |
 | `face_utils.py` | Shared MediaPipe mesh feature extraction, pose estimation, quality checks, and graph features. |
-| `embedding_utils.py` | Optional InsightFace embedding support. |
 | `neural_brain_viz.py` | Open3D 3D viewer for the model/pipeline nodes and sampled/strongest connections. |
 | `face_data.csv` | Saved enrollment data for mesh mode. |
 | `face_model.pkl` | Trained recognition model. |
@@ -48,22 +47,21 @@ Install the base dependencies:
 pip install -r requirements.txt
 ```
 
-This installs the mesh backend, embedding backend, and Open3D visualization
-dependencies in one step.
+This installs the mesh backend and Open3D visualization dependencies in one step.
 
 ## Mesh Backend Commands
 
 Enroll at least two people if you want the model to tell faces apart:
 
 ```powershell
-python enroll.py --name "Alice" --backend mesh
-python enroll.py --name "Bob" --backend mesh
+python enroll.py --name "Alice"
+python enroll.py --name "Bob"
 ```
 
 Train the mesh model:
 
 ```powershell
-python train.py --backend mesh --clean-percentile 90
+python train.py --clean-percentile 90
 ```
 
 Run live recognition:
@@ -74,18 +72,10 @@ python recognize.py
 
 Press `Q` to quit the webcam window.
 
-## Embedding Backend Commands
+## Embedding Backend
 
-If the InsightFace install works:
-
-```powershell
-python enroll.py --name "Alice" --backend embedding
-python enroll.py --name "Bob" --backend embedding
-python train.py --backend embedding
-python recognize.py
-```
-
-If `insightface` fails to install on Windows, use the mesh backend instead.
+InsightFace embedding support has been removed from this project. Use the
+mesh backend (MediaPipe landmarks + MLP) which is easier to run on Windows.
 
 ## How The Mesh Model Works
 
@@ -139,7 +129,7 @@ Instead:
 
 - multi-person MLP mode shows the strongest learned connections
 - one-person centroid mode shows sampled conceptual pipeline links
-- embedding mode shows the embedding comparison pipeline
+- one-person centroid mode shows sampled conceptual pipeline links
 
 Useful options:
 
@@ -162,7 +152,6 @@ python neural_brain_viz.py --demo-mlp --demo-people 2
 - Enroll in good lighting and avoid motion blur.
 - Re-train after adding new people.
 - Use `--clean-percentile 90` in mesh mode to remove outlier samples.
-- Use the embedding backend if InsightFace installs successfully.
 
 ## Notes
 
