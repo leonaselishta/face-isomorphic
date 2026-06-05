@@ -114,14 +114,20 @@ def make_sphere_mesh(o3d, nodes, colors, radius, subdivision=SPHERE_RES):
 
 
 # ── edge helpers ──────────────────────────────────────────────────────────────
-def build_strongest_edges(weights, layers, edges_per_layer, start_layer=0):
-    offsets      = layer_offsets(layers)
+def build_strongest_edges(weights, mlp_layers, edges_per_layer):
+    """
+    Build edges for the MLP portion only.
+
+    mlp_layers : the layer sizes that the MLP weight matrices span,
+                 i.e. [mlp_input, h1, h2, ..., output].
+                 len(mlp_layers) == len(weights) + 1
+    """
+    offsets      = layer_offsets(mlp_layers)
     line_chunks  = []
     color_chunks = []
 
     for li, weight_matrix in enumerate(weights):
-        layer_idx = start_layer + li
-        flat_abs  = np.abs(weight_matrix).ravel()
+        flat_abs = np.abs(weight_matrix).ravel()
         if flat_abs.size == 0:
             continue
         k = min(int(edges_per_layer), flat_abs.size)
@@ -133,13 +139,13 @@ def build_strongest_edges(weights, layers, edges_per_layer, start_layer=0):
 
         src, dst = np.unravel_index(pick, weight_matrix.shape)
         line_chunks.append(np.column_stack([
-            offsets[layer_idx]     + src,
-            offsets[layer_idx + 1] + dst,
+            offsets[li]     + src,
+            offsets[li + 1] + dst,
         ]))
         signed = weight_matrix.ravel()[pick]
         c = np.zeros((len(pick), 3), dtype=np.float64)
-        c[signed >= 0] = (0.45, 0.65, 0.90)   # cool blue  — positive weight
-        c[signed <  0] = (0.90, 0.45, 0.38)   # muted rose — negative weight
+        c[signed >= 0] = (0.45, 0.65, 0.90)
+        c[signed <  0] = (0.90, 0.45, 0.38)
         color_chunks.append(c * 0.50)
 
     if not line_chunks:
@@ -206,16 +212,27 @@ def architecture(bundle):
         pca_dim  = int(getattr(bundle.get("pca"), "n_components_",
                                model.coefs_[0].shape[0]))
         layers   = [feat_dim, pca_dim]
-        if bundle.get("use_lda", "lda" in bundle):
-            layers.append(int(model.coefs_[0].shape[0]))
-        layers.extend(int(c.shape[1]) for c in model.coefs_)
-        path = ("PCA + LDA + MLP" if bundle.get("use_lda", "lda" in bundle)
-                else "PCA + MLP")
+
+        use_lda = bundle.get("use_lda", False)
+        n_classes = len(bundle["encoder"].classes_)
+        if use_lda and "lda" in bundle:
+            lda_out = int(bundle["lda"].n_components)
+            layers.append(lda_out)
+            weight_start = len(layers) - 1
+        else:
+            weight_start = len(layers) - 1
+
+        # MLP hidden layers from coefs (skip last coef's output — use encoder count)
+        for c in model.coefs_[:-1]:
+            layers.append(int(c.shape[1]))
+        layers.append(n_classes)   # true output count, not coefs[-1].shape[1]
+
+        path = "PCA + LDA + MLP" if use_lda else "PCA + MLP"
         return {
-            "title": "Mesh MLP neural network",
+            "title": f"Mesh MLP — {n_classes} people  ({', '.join(bundle['encoder'].classes_)})",
             "layers": layers,
             "weights": model.coefs_,
-            "weight_start_layer": 2 if bundle.get("use_lda", "lda" in bundle) else 1,
+            "weight_start_layer": weight_start,
             "note": f"{path}. Showing strongest learned MLP connections.",
         }
     feat_dim = int(bundle.get("feat_dim", 1534))
@@ -287,11 +304,17 @@ def main():
     if info["weights"] is None:
         lines, line_colors = pseudo_edges(layers, args.edges_per_layer)
     else:
-        start  = int(info.get("weight_start_layer", 0))
+        # pre-MLP layers (feat → PCA → optional LDA) get pseudo edges
+        # MLP layers get real weight-based edges
+        start  = int(info.get("weight_start_layer", len(layers) - len(info["weights"]) - 1))
         pl, pc = pseudo_edges_for_range(layers, args.edges_per_layer, 0, start)
+        # mlp_layers is the slice of layers that the MLP weights span
+        mlp_layers = layers[start:]
         ml, mc = build_strongest_edges(
-            info["weights"], layers, args.edges_per_layer,
-            start_layer=start)
+            info["weights"], mlp_layers, args.edges_per_layer)
+        # ml indices are relative to mlp_layers; shift them by the node offset of start
+        node_offset = sum(layers[:start])
+        ml = ml + node_offset
         lines       = np.vstack([pl, ml])
         line_colors = np.vstack([pc, mc])
 

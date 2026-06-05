@@ -11,8 +11,11 @@ from sklearn.preprocessing    import StandardScaler, LabelEncoder
 from sklearn.decomposition    import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.neural_network   import MLPClassifier
+from sklearn.svm              import SVC
 from sklearn.model_selection  import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics          import classification_report
+from sklearn.pipeline         import Pipeline
+from sklearn.calibration      import CalibratedClassifierCV
 
 from face_utils import N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER
 from embedding_utils import (
@@ -24,10 +27,11 @@ log = logging.getLogger(__name__)
 
 DATA_FILE        = "face_data.csv"
 MODEL_FILE       = "face_model.pkl"
-N_PCA_MAX        = 200          # hard cap on PCA components
-PCA_VARIANCE     = 0.97         # keep enough components for 97 % variance
-SPECTRAL_WEIGHT  = 3.0          # Laplacian eigenvalues upweighted ×3
-RATIO_WEIGHT     = 2.0          # distance ratios upweighted ×2
+N_PCA_MAX        = 200
+PCA_VARIANCE     = 0.97
+PCA_MIN_DIMS     = 80           # raised from 50 — more dims = more signal for SVM
+SPECTRAL_WEIGHT  = 3.0
+RATIO_WEIGHT     = 2.0
 THRESHOLD_PCTILE = 95
 THRESHOLD_FACTOR = 1.2
 EMBEDDING_THRESHOLD_FLOOR = 0.38
@@ -105,17 +109,34 @@ def make_mlp():
     )
 
 
-def calibrate_unknown_rejection(model, X, floor=0.65):
+def make_svm():
+    """
+    RBF SVM with Platt scaling (sigmoid calibration).
+    Platt scaling gives more realistic probabilities than isotonic
+    on small datasets — isotonic overfits and collapses to 0/1.
+    """
+    base = SVC(kernel="rbf", C=10.0, gamma="scale",
+               class_weight="balanced", random_state=42)
+    return CalibratedClassifierCV(base, cv=5, method="sigmoid")
+
+
+def calibrate_unknown_rejection(model, X, n_classes):
+    """
+    Set a fixed threshold based on what SVM/MLP confidences look like
+    in practice. We use a hard floor of 0.55 — well above random (0.5)
+    but low enough that live-video frames with slight noise still pass.
+    """
     proba = model.predict_proba(X)
-    best = proba.max(axis=1)
-    ordered = np.sort(proba, axis=1)
-    margins = ordered[:, -1] - ordered[:, -2] if proba.shape[1] > 1 else best
-    conf_threshold = max(floor, float(np.percentile(best, 10) * 0.95))
-    margin_threshold = max(0.05, float(np.percentile(margins, 10) * 0.80))
-    log.info(
-        "Unknown rejection: confidence >= %.2f and margin >= %.2f",
-        conf_threshold, margin_threshold)
-    return conf_threshold, margin_threshold
+    best  = proba.max(axis=1)
+    median_conf = float(np.median(best))
+    log.info("Training confidence — median: %.3f  min: %.3f  max: %.3f",
+             median_conf, float(best.min()), float(best.max()))
+    # Use a fixed floor of 0.55 — do NOT derive from training data because
+    # calibrated SVMs on clean augmented data return near-1.0 on training
+    # samples, which would set an unreachable threshold for live video.
+    conf_threshold = 0.55
+    log.info("Unknown rejection threshold: %.2f  (fixed floor)", conf_threshold)
+    return conf_threshold
 
 
 # ── multi-person mode ─────────────────────────────────────────────────────────
@@ -123,58 +144,61 @@ def train_multi(X_pca, labels, le, n_classes, classifier):
     """
     Train the multi-person mesh classifier.
 
-    classifier="mlp" keeps the richer PCA representation and sends it directly
-    to the MLP. classifier="lda-mlp" keeps the older PCA -> LDA -> MLP path.
+    classifier="svm"     — RBF SVM (default, best accuracy on small datasets)
+    classifier="lda-mlp" — PCA -> LDA -> MLP  (faster inference)
+    classifier="mlp"     — PCA -> MLP (no LDA compression)
     """
     y_enc = le.fit_transform(labels)
 
     lda = None
-    if classifier == "lda-mlp":
-        # LDA is limited to (n_classes - 1) dimensions. This can be useful with
-        # many classes, but it is very aggressive for two-person datasets.
-        n_lda = min(n_classes - 1, X_pca.shape[1])
-        lda = LDA(n_components=n_lda, solver="svd", store_covariance=True)
+    if classifier in ("lda-mlp", "svm"):
+        n_lda   = min(n_classes - 1, X_pca.shape[1])
+        lda     = LDA(n_components=n_lda, solver="svd", store_covariance=True)
         X_model = lda.fit_transform(X_pca, y_enc)
-        log.info(f"LDA: {X_pca.shape[1]}D -> {X_model.shape[1]}D  "
-                 f"(class-separating compression for {n_classes} people)")
+        log.info("LDA: %dD -> %dD  (class-separating compression for %d people)",
+                 X_pca.shape[1], X_model.shape[1], n_classes)
     else:
         X_model = X_pca
-        log.info(
-            "Classifier input: PCA features kept at %dD (no LDA compression)",
-            X_model.shape[1])
+        log.info("Classifier input: PCA features at %dD (no LDA)", X_model.shape[1])
 
     X_tr, X_te, y_tr, y_te = train_test_split(
         X_model, y_enc, test_size=0.2, random_state=42, stratify=y_enc)
 
-    model = make_mlp()
+    if classifier == "svm":
+        model = make_svm()
+        log.info("Training RBF SVM + Platt sigmoid calibration …")
+    else:
+        model = make_mlp()
+        log.info("Training MLP …")
+
     model.fit(X_tr, y_tr)
 
     y_pred = model.predict(X_te)
     log.info("\n── Evaluation ──────────────────────────────────────────────")
     log.info("\n" + classification_report(y_te, y_pred, target_names=le.classes_))
 
-    # cross-validation for a more robust accuracy estimate
+    # cross-validation accuracy
     if len(X_model) >= 10:
+        cv_model = make_svm() if classifier == "svm" else make_mlp()
         cv_scores = cross_val_score(
-            make_mlp(),
-            X_model, y_enc,
+            cv_model, X_model, y_enc,
             cv=StratifiedKFold(n_splits=min(5, len(np.unique(y_enc))),
                                shuffle=True, random_state=42),
             scoring="accuracy",
         )
-        log.info(f"Cross-val accuracy: {cv_scores.mean()*100:.1f}% "
-                 f"± {cv_scores.std()*100:.1f}%")
+        log.info("Cross-val accuracy: %.1f%% ± %.1f%%",
+                 cv_scores.mean()*100, cv_scores.std()*100)
 
-    conf_threshold, margin_threshold = calibrate_unknown_rejection(model, X_model)
+    conf_threshold = calibrate_unknown_rejection(model, X_model, n_classes)
 
     bundle = {
-        "mode": "multi_person",
-        "model": model,
-        "encoder": le,
-        "classifier": classifier,
-        "use_lda": lda is not None,
+        "mode":           "multi_person",
+        "model":          model,
+        "encoder":        le,
+        "classifier":     classifier,
+        "use_lda":        lda is not None,
         "conf_threshold": conf_threshold,
-        "margin_threshold": margin_threshold,
+        "margin_threshold": 0.0,   # not used for SVM — single threshold only
     }
     if lda is not None:
         bundle["lda"] = lda
@@ -265,9 +289,9 @@ def main():
     parser.add_argument("--embedding-data", default=EMBEDDING_DATA_FILE)
     parser.add_argument("--clean-percentile", type=float,
                         help="Drop per-person mesh outliers above this percentile")
-    parser.add_argument("--classifier", choices=("mlp", "lda-mlp"),
-                        default="mlp",
-                        help="Mesh multi-person classifier (default: mlp keeps PCA dimensions)")
+    parser.add_argument("--classifier", choices=("svm", "mlp", "lda-mlp"),
+                        default="svm",
+                        help="Classifier: svm (default, most accurate), lda-mlp, mlp")
     args = parser.parse_args()
 
     if args.backend == "embedding":
@@ -324,13 +348,14 @@ def main():
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X_w)
 
-    # PCA: keep 97 % variance, capped at N_PCA_MAX
+    # PCA: keep 97 % variance, capped at N_PCA_MAX, minimum 50 components
     n_comp_max = min(N_PCA_MAX, X_scaled.shape[0] - 1, X_scaled.shape[1])
     pca_full   = PCA(n_components=n_comp_max, random_state=42)
     pca_full.fit(X_scaled)
     cumvar     = np.cumsum(pca_full.explained_variance_ratio_)
     n_comp     = int(np.searchsorted(cumvar, PCA_VARIANCE) + 1)
-    n_comp     = max(n_comp, n_classes * 4)   # keep at least 4× n_classes dims
+    n_comp     = max(n_comp, PCA_MIN_DIMS)    # never fewer than PCA_MIN_DIMS
+    n_comp     = max(n_comp, n_classes * 4)
     n_comp     = min(n_comp, n_comp_max)
 
     pca    = PCA(n_components=n_comp, random_state=42)

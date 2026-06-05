@@ -34,7 +34,7 @@ POSES = [
     ("Down ~15°",   "Tilt your head DOWN slightly",   0,  15),
 ]
 
-JITTER_SIGMA = 0.0015   # Gaussian noise sigma for augmentation
+JITTER_SIGMA = 0.004   # stronger jitter — better simulates live lighting/motion variation
 MIN_REAL_SAMPLES_PER_PERSON = 120
 
 

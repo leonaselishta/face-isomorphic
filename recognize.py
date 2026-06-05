@@ -23,12 +23,11 @@ mp_draw_styles = mp.solutions.drawing_styles
 
 MODEL_FILE     = "face_model.pkl"
 MAX_FACES      = 6
-SMOOTH_WINDOW  = 20
-SPECTRAL_EVERY = 10   # recompute Laplacian every N frames per face
-MLP_THRESHOLD  = 0.70
+SMOOTH_WINDOW  = 30
+SPECTRAL_EVERY = 5           # refresh Laplacian more often for fresher features
+MLP_THRESHOLD  = 0.55
 TRACK_IOU_THRESHOLD = 0.25
 
-# Pose limits — beyond these angles show "?" not a wrong name
 YAW_LIMIT   = 40
 PITCH_LIMIT = 30
 ROLL_LIMIT  = 25
@@ -50,7 +49,7 @@ def to_discriminant(bundle, feat_raw):
     feat_s = bundle["scaler"].transform(feat.reshape(1, -1))
     feat_p = bundle["pca"].transform(feat_s)[0]
 
-    if bundle["mode"] == "multi_person" and bundle.get("use_lda", "lda" in bundle):
+    if bundle["mode"] == "multi_person" and bundle.get("use_lda") and "lda" in bundle:
         feat_p = bundle["lda"].transform(feat_p.reshape(1, -1))[0]
 
     return feat_p
@@ -69,15 +68,12 @@ def predict(bundle, feat_d):
             return bundle["name"], conf
         return "Unknown", 0.0
 
-    # multi-person: MLP on PCA or LDA-projected space
     proba = bundle["model"].predict_proba(feat_d.reshape(1, -1))[0]
     idx   = int(np.argmax(proba))
     conf  = float(proba[idx])
-    ordered = np.sort(proba)
-    margin = float(ordered[-1] - ordered[-2]) if len(ordered) > 1 else conf
     conf_threshold = float(bundle.get("conf_threshold", MLP_THRESHOLD))
-    margin_threshold = float(bundle.get("margin_threshold", 0.0))
-    if conf >= conf_threshold and margin >= margin_threshold:
+
+    if conf >= conf_threshold:
         return bundle["encoder"].classes_[idx], conf
     return "Unknown", conf
 
@@ -107,7 +103,7 @@ class FaceSmoother:
         self.confs       = deque(maxlen=SMOOTH_WINDOW)
         self.cached_spec = None
         self.spec_frame  = -999
-        self.center      = None          # (cx, cy) in pixel coords
+        self.center      = None
         self.bbox        = None
         self._lap_worker = MeshLaplacianWorker() if use_laplacian else None
         if self._lap_worker is not None:
@@ -138,15 +134,28 @@ class FaceSmoother:
     def label(self):
         if not self.names:
             return "..."
-        counts = {}
-        for n in self.names:
-            counts[n] = counts.get(n, 0) + 1
-        return max(counts, key=counts.get)
+        # Confidence-weighted vote: Unknown and ? frames get low weight (0.1)
+        # so a few bad frames can't flip the displayed label.
+        scores = {}
+        for name, conf in zip(self.names, self.confs):
+            weight = conf if name not in ("Unknown", "?", "...") else 0.1
+            scores[name] = scores.get(name, 0.0) + weight
+        # Only return a real name if it has a clear lead over Unknown
+        best = max(scores, key=scores.get)
+        if best in ("Unknown", "?", "..."):
+            return best
+        unknown_score = scores.get("Unknown", 0.0) + scores.get("?", 0.0)
+        if scores[best] > unknown_score * 1.5:   # real name must be 1.5× stronger
+            return best
+        return "Unknown"
 
     @property
     def confidence(self):
         w    = self.label
-        vals = [c for n, c in zip(self.names, self.confs) if n == w]
+        vals = [c for n, c in zip(self.names, self.confs)
+                if n == w and n not in ("Unknown", "?", "...")]
+        if not vals:
+            vals = [c for n, c in zip(self.names, self.confs) if n == w]
         return float(np.mean(vals)) if vals else 0.0
 
 
@@ -362,43 +371,49 @@ def main():
 
                     # extract features + predict
                     yaw = pitch = roll = 0.0
+                    pose_extreme = False
                     try:
                         feat, yaw, pitch, roll = extract_features(
                             face_lms, smoother.cached_spec)
-                        feat_d = to_discriminant(bundle, feat)
 
-                        if is_pose_extreme(yaw, pitch, roll,
-                                           YAW_LIMIT, PITCH_LIMIT, ROLL_LIMIT):
-                            name, conf = "?", 0.0
-                        else:
+                        pose_extreme = is_pose_extreme(
+                            yaw, pitch, roll, YAW_LIMIT, PITCH_LIMIT, ROLL_LIMIT)
+
+                        if not pose_extreme:
+                            feat_d     = to_discriminant(bundle, feat)
                             name, conf = predict(bundle, feat_d)
-
-                        smoother.update(name, conf)
+                            smoother.update(name, conf)
                     except Exception as exc:
                         log.debug("Feature extraction error: %s", exc)
 
                     x1, y1, x2, y2 = landmark_bbox(face_lms, w, h)
                     smoother.bbox = (x1, y1, x2, y2)
 
-                    label    = smoother.label
-                    conf_val = smoother.confidence
-                    if label not in ("Unknown", "...", "?"):
-                        color = (0, 220, 0)
-                    elif label == "?":
-                        color = (200, 200, 0)
+                    if pose_extreme:
+                        # show yellow "?" without touching the smoother history
+                        cv2.rectangle(frame, (x1, y1-5), (x2, y2+5), (200, 200, 0), 2)
+                        cv2.putText(frame, "?  pose",
+                                    (x1, y1-12),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (200, 200, 0), 2)
                     else:
-                        color = (0, 0, 220)
+                        label    = smoother.label
+                        conf_val = smoother.confidence
+                        if label not in ("Unknown", "...", "?"):
+                            color = (0, 220, 0)
+                        elif label == "?":
+                            color = (200, 200, 0)
+                        else:
+                            color = (0, 0, 220)
 
-                    cv2.rectangle(frame, (x1, y1 - 5), (x2, y2 + 5), color, 2)
-                    conf_str = f"{conf_val * 100:.0f}%" if label != "?" else "pose?"
-                    cv2.putText(frame, f"{label}  {conf_str}",
-                                (x1, y1 - 12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
+                        cv2.rectangle(frame, (x1, y1-5), (x2, y2+5), color, 2)
+                        conf_str = f"{conf_val*100:.0f}%"
+                        cv2.putText(frame, f"{label}  {conf_str}",
+                                    (x1, y1-12),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
 
-                    # pose angles overlay
                     cv2.putText(frame,
                                 f"Y:{yaw:+.0f} P:{pitch:+.0f} R:{roll:+.0f}",
-                                (x1, y2 + 16),
+                                (x1, y2+16),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                                 (140, 200, 140), 1)
 
