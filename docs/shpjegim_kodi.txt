@@ -1,0 +1,177 @@
+SHPJEGIM I KODIT - face-isomorphic
+
+Ky projekt tani punon kryesisht me backend-in Mesh dhe ka hequr suportin embedding/InsightFace nga rrjedha bazë.
+
+Projekti perdor MediaPipe Face Mesh për të nxjerrë pikat e fytyrës dhe pastaj gjeneron një model të thjeshtë për njohje fytyrash.
+
+Hapat kryesorë të projektit:
+
+1. enroll.py    -> mbledh mostra për fytyrat e personave
+2. train.py     -> trajnon modelin dhe ruan face_model.pkl
+3. recognize.py -> punon njohjen live nga kamera
+4. neural_brain_viz.py -> vizualizon modelin/pipeline-in në 3D
+
+MediaPipe përdoret vetëm për të gjetur landmark-et e fytyrës. Krahasimi dhe njohja bëhen nga modeli i ruajtur në face_model.pkl.
+
+1. enroll.py
+
+Ky skedar hap kamerën dhe regjistron mostra fytyrash për një person me emër.
+Shembuj:
+
+python enroll.py --name 'Alice'
+python enroll.py --name 'Bob'
+
+Çdo herë kur kapet një frame, kodi kontrollon saktësinë e saj:
+- nëse fytyra është mjaftueshëm e madhe në imazh
+- nëse imazhi është i paqartë ose i turbullt
+- nëse ndriçimi është shumë i dobët ose shumë i fortë
+- nëse poza e kokës është shumë ekstreme
+- nëse poza përputhet me udhëzimin aktual
+
+Nëse frame është i mirë, të dhënat e mesh-it ruhen në face_data.csv.
+Tani backend-i parazgjedhur është vetëm mesh, dhe nuk ruhen më embedding-e.
+
+2. face_utils.py
+
+Ky skedar përmban funksionet për të përpunuar MediaPipe Face Mesh.
+MediaPipe jep 478 pika të fytyrës. Kodi i shndërron këto pika në një vektor
+numerik prej 1534 vlerash.
+
+Ky vektor përmban:
+- 1434 vlera: koordinatat 3D të normalizuara për 478 pika
+- 50 vlera: raporte distancesh midis së dy syve, hundës, gojës, mjekrës, faqeve
+- 50 vlera: veçori spektrale të grafit të fytyrës të llogaritura me Laplacian
+
+Gjithashtu gjenerohen vlerat e pozës së kokës:
+- yaw   (majtas/djathtas)
+- pitch (lart/poshtë)
+- roll  (rrotullim)
+
+Këto vlera përdoren për refuzimin e pozave të gabuara dhe për të përmirësuar cilësinë e të dhënave.
+
+3. train.py
+
+Ky skedar trajnon modelin dhe krijon face_model.pkl.
+Ai lexon të dhënat e regjistruara nga face_data.csv dhe ndjek një rrjedhë të bazuar në Mesh backend.
+
+Rrjedha parazgjedhur është:
+
+feature weights -> StandardScaler -> PCA -> MLPClassifier
+
+Përkufizimet:
+- feature weights: peshon disa pjesë të vektorit për të përmirësuar sinjalin
+- StandardScaler: normalizon njësi të ndryshme të vlerave
+- PCA: zvogëlon dimensionet dhe heq zhurmën
+- MLPClassifier: klasifikues neural për të dalluar personat
+
+Sjellje e rëndësishme:
+- Nëse ka vetëm një person të regjistruar, nuk trajnohet rrjet neural MLP.
+  Projektit i mjafton një qendër mesatare (centroid) dhe vendos nëse fytyra
+  i përket atij personi ose Unknown.
+- Nëse ka dy ose më shumë persona, trajnohet rrjeti neural MLP.
+
+Shtresat e fshehura të MLP-së janë të fikse:
+
+512 -> 256 -> 128 -> 64
+
+Shtresa e daljes ka saktësisht aq neurone sa persona janë regjistruar.
+
+Opsioni LDA mbetet në kod si mundësi, por nuk është rruga parazgjedhëse.
+Ai mund të përdoret me:
+
+python train.py --backend mesh --classifier lda-mlp --clean-percentile 90
+
+4. recognize.py
+
+Ky skedar hap kamerën dhe bën njohje live të fytyrave.
+Procesi është:
+1. lexon face_model.pkl
+2. gjen fytyrat në imazh
+3. nxjerr veçoritë nga fytyra
+4. përdor modelin për të parashikuar emrin
+5. shfaq emrin, Unknown ose ? në ekran
+
+Mekanizmat e stabilitetit përfshijnë:
+- smoothim të rezultateve në disa frame
+- ndjekje të fytyrave me bbox/IoU kur ka më shumë se një person
+- refuzim të pozave të skajshme
+- shfaqje Unknown kur besimi i modelit është i ulët
+
+5. neural_brain_viz.py
+
+Ky skedar shfaq modelin dhe pipeline-in në një dritare 3D me Open3D.
+Ai vizualizon nyjet e arkitekturës dhe lidhjet më të forta.
+
+Komanda:
+
+python neural_brain_viz.py
+
+Ai nuk shfaq të gjitha lidhjet, sepse ato mund të jenë shumë të shumta.
+Për këtë arsye shfaqet vetëm një numër i kufizuar lidhjesh me peshë
+më të madhe.
+
+Opsionet e dobishme:
+
+python neural_brain_viz.py --edges-per-layer 150
+python neural_brain_viz.py --node-radius 0.12
+
+Nëse dëshiron të shikosh një rrjet MLP demo pa ndryshuar face_model.pkl:
+
+python neural_brain_viz.py --demo-mlp --demo-people 2
+
+6. requirements.txt
+
+Ky skedar përmban varësitë kryesore që përdor projekti:
+- opencv-python
+- mediapipe
+- numpy
+- scikit-learn
+- joblib
+- networkx
+- matplotlib
+- scipy
+- open3d
+
+Këto janë varësitë që duhen për backend-in Mesh dhe vizualizimin 3D.
+
+SI TË EKZEKUTOSH PROJEKTIN
+
+1. Krijo dhe aktivizo një virtual environment:
+
+python -m venv venv
+venv\Scripts\activate
+
+2. Instalo varësitë:
+
+pip install -r requirements.txt
+
+3. Regjistro disa persona:
+
+python enroll.py --name 'Alice'
+python enroll.py --name 'Bob'
+
+4. Trajno modelin:
+
+python train.py --clean-percentile 90
+
+5. Fillo njohjen live:
+
+python recognize.py
+
+Shtyp Q për të mbyllur dritaren e kameras.
+
+KUR PËRDOR TRENINGUN ME CENTROID?
+
+- Me vetëm një person të regjistruar, modeli përdor centroid dhe nuk është
+  MLP neural.
+- Me dy ose më shumë persona, train.py krijon një rrjet neural MLP.
+
+PERMBLEDHJE
+
+- MediaPipe zbulon landmark-et e fytyrës.
+- face_utils.py i kthen landmark-et në një vektor 1534-dimensional.
+- train.py krijon face_model.pkl.
+- recognize.py përdor face_model.pkl për njohje live.
+- neural_brain_viz.py vizualizon modelin në 3D.
+- Backend-i parazgjedhur tani është Mesh; embedding/InsightFace nuk është më
+  pjesë e rrjedhës kryesore.

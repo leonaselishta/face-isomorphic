@@ -7,18 +7,31 @@ import argparse
 import logging
 import os
 import csv
+from pathlib import Path
 
-from face_utils import (
-    extract_features, face_quality, landmark_bbox, pose_matches_target,
-    MeshLaplacianWorker, N_COORDS, FEAT_DIM, SCHEMA_VER,
-)
+try:
+    from .face_utils import (
+        extract_features, face_quality, landmark_bbox, pose_matches_target,
+        MeshLaplacianWorker, FEAT_DIM, SCHEMA_VER,
+    )
+except ImportError:
+    import sys
+    from pathlib import Path
+    ROOT_DIR = Path(__file__).resolve().parent.parent
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
+    from face_isomorphic.face_utils import (
+        extract_features, face_quality, landmark_bbox, pose_matches_target,
+        MeshLaplacianWorker, FEAT_DIM, SCHEMA_VER,
+    )
 # embedding backend removed — mesh-only enrollment
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
 mp_face_mesh = mp.solutions.face_mesh
-DATA_FILE    = "face_data.csv"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DATA_FILE = ROOT_DIR / "face_data.csv"
 
 # How often to request a new Laplacian computation (frames).
 # The worker runs async so this just controls how fresh the cached value is.

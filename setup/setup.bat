@@ -1,6 +1,11 @@
 @echo off
 setlocal
 
+rem Ensure all venvs are created in the repository root, not inside the setup folder.
+set "SCRIPT_DIR=%~dp0"
+pushd "%SCRIPT_DIR%.."
+set "ROOT_DIR=%CD%"
+
 echo Checking Python version...
 
 set PYVER=
@@ -63,71 +68,65 @@ echo ==========================
 echo Setting up main venv
 echo ==========================
 
-set VENV_MAIN=venv
-
-if exist "%VENV_MAIN%\Scripts\activate.bat" (
-    echo Main venv already exists, skipping creation and dependency install.
-) else (
-    echo Creating main venv...
-    %PYTHON_EXE% -m venv %VENV_MAIN%
-
-    if not exist "%VENV_MAIN%\Scripts\activate.bat" (
-        echo ERROR: Failed to create main venv
-        pause
-        exit /b 1
-    )
-
-    call %VENV_MAIN%\Scripts\activate.bat
-
-    python -m pip install --upgrade pip
-
-    if exist requirements.txt (
-        pip install -r requirements.txt
-    ) else (
-        echo No requirements.txt found for main venv
-    )
-
-    deactivate
-)
+set "VENV_MAIN=%ROOT_DIR%\venv"
+call :ensure_venv "%VENV_MAIN%" "%ROOT_DIR%\requirements.txt"
 
 echo ==========================
 echo Setting up DeepFace venv
 echo ==========================
 
-set VENV_DEEPFACE=venv-deepface
+set "VENV_DEEPFACE=%ROOT_DIR%\venv-deepface"
 
 if exist "%VENV_DEEPFACE%\Scripts\activate.bat" (
     echo DeepFace venv already exists, skipping creation and dependency install.
 ) else (
     set /p CREATE_DEEPFACE="DeepFace venv not found. Create venv-deepface and install dependencies? [y/N]: "
     if /i "%CREATE_DEEPFACE%"=="y" (
-        echo Creating DeepFace venv...
-        %PYTHON_EXE% -m venv %VENV_DEEPFACE%
-
-        if not exist "%VENV_DEEPFACE%\Scripts\activate.bat" (
-            echo ERROR: Failed to create deepface venv
-            pause
-            exit /b 1
-        )
-
-        call %VENV_DEEPFACE%\Scripts\activate.bat
-
-        python -m pip install --upgrade pip
-
-        if exist requirements-deepface.txt (
-            pip install -r requirements-deepface.txt
-        ) else (
-            echo No requirements-deepface.txt found
-        )
-
-        deactivate
+        call :ensure_venv "%VENV_DEEPFACE%" "%ROOT_DIR%\requirements-deepface.txt"
     ) else (
         echo Skipping DeepFace venv creation as requested.
     )
 )
 
+goto :Done
+
+:ensure_venv
+setlocal
+set "VENV_PATH=%~1"
+set "REQ_FILE=%~2"
+if exist "%VENV_PATH%\Scripts\activate.bat" (
+    endlocal
+    goto :EOF
+)
+echo Creating venv at %VENV_PATH%...
+%PYTHON_EXE% -m venv "%VENV_PATH%"
+
+if not exist "%VENV_PATH%\Scripts\activate.bat" (
+    echo ERROR: Failed to create venv at %VENV_PATH%
+    pause
+    popd
+    exit /b 1
+)
+
+call "%VENV_PATH%\Scripts\activate.bat"
+python -m pip install --upgrade pip
+
+if exist "%REQ_FILE%" (
+    pip install -r "%REQ_FILE%"
+) else (
+    echo No %REQ_FILE% found
+)
+
+deactivate
+endlocal
+
+goto :EOF
+
+:Done
+
 echo ==========================
 echo Setup complete
 echo ==========================
 
+popd
 pause

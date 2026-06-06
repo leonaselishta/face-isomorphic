@@ -7,12 +7,14 @@ Controls (shown in console on launch):
 
 import argparse
 import os
+from pathlib import Path
 
 import joblib
 import numpy as np
 
 
-MODEL_FILE      = "face_model.pkl"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MODEL_FILE      = ROOT_DIR / "face_model.pkl"
 EDGES_PER_LAYER = 320
 NODE_RADIUS     = 0.22
 Z_SPACING       = 4.0

@@ -7,11 +7,23 @@ import joblib
 import os
 import logging
 from collections import deque
+from pathlib import Path
 
-from face_utils import (
-    extract_features, landmark_bbox, is_pose_extreme, MeshLaplacianWorker,
-    N_SPECTRAL, N_RATIOS, N_COORDS, SCHEMA_VER,
-)
+try:
+    from .face_utils import (
+        extract_features, landmark_bbox, is_pose_extreme, MeshLaplacianWorker,
+        N_SPECTRAL, N_RATIOS, N_COORDS, SCHEMA_VER,
+    )
+except ImportError:
+    import sys
+    from pathlib import Path
+    ROOT_DIR = Path(__file__).resolve().parent.parent
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
+    from face_isomorphic.face_utils import (
+        extract_features, landmark_bbox, is_pose_extreme, MeshLaplacianWorker,
+        N_SPECTRAL, N_RATIOS, N_COORDS, SCHEMA_VER,
+    )
 # embedding backend removed; mesh-only recognition
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -21,7 +33,8 @@ mp_face_mesh   = mp.solutions.face_mesh
 mp_drawing     = mp.solutions.drawing_utils
 mp_draw_styles = mp.solutions.drawing_styles
 
-MODEL_FILE     = "face_model.pkl"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MODEL_FILE     = ROOT_DIR / "face_model.pkl"
 MAX_FACES      = 6
 SMOOTH_WINDOW  = 30
 SPECTRAL_EVERY = 5           # refresh Laplacian more often for fresher features

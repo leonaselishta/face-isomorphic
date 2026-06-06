@@ -6,6 +6,7 @@ import numpy as np
 import csv
 import joblib
 import os
+from pathlib import Path
 
 from sklearn.preprocessing    import StandardScaler, LabelEncoder
 from sklearn.decomposition    import PCA
@@ -14,17 +15,25 @@ from sklearn.neural_network   import MLPClassifier
 from sklearn.svm              import SVC
 from sklearn.model_selection  import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics          import classification_report
-from sklearn.pipeline         import Pipeline
 from sklearn.calibration      import CalibratedClassifierCV
 
-from face_utils import N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER
+try:
+    from .face_utils import N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER
+except ImportError:
+    import sys
+    from pathlib import Path
+    ROOT_DIR = Path(__file__).resolve().parent.parent
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
+    from face_isomorphic.face_utils import N_SPECTRAL, N_RATIOS, N_COORDS, FEAT_DIM, SCHEMA_VER
 # embedding backend removed; mesh-only training
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-DATA_FILE        = "face_data.csv"
-MODEL_FILE       = "face_model.pkl"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DATA_FILE        = ROOT_DIR / "face_data.csv"
+MODEL_FILE       = ROOT_DIR / "face_model.pkl"
 N_PCA_MAX        = 200
 PCA_VARIANCE     = 0.97
 PCA_MIN_DIMS     = 80           # raised from 50 — more dims = more signal for SVM
@@ -201,7 +210,6 @@ def train_multi(X_pca, labels, le, n_classes, classifier):
     return bundle
 
 
-# ── embedding mode ────────────────────────────────────────────────────────────
 
 
 
@@ -214,8 +222,8 @@ def main():
     parser.add_argument("--clean-percentile", type=float,
                         help="Drop per-person mesh outliers above this percentile")
     parser.add_argument("--classifier", choices=("svm", "mlp", "lda-mlp"),
-                        default="svm",
-                        help="Classifier: svm (default, most accurate), lda-mlp, mlp")
+                        default="mlp",
+                        help="Classifier: mlp (default), lda-mlp, svm")
     args = parser.parse_args()
 
     # embedding backend removed; always train mesh model
